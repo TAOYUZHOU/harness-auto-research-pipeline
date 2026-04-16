@@ -6,15 +6,17 @@ Called by cron (or manually).  Each invocation:
   1. Acquires flock (skip if another tick is running)
   2. Scans RESULT_ROOT for new/updated training logs
   3. Parses metrics, maps to plan anchors
-  4. Appends summaries to log.md
-  5. Optionally invokes agent to propose next experiment
-  6. Checks stop conditions → disables cron if met
+  4. Git: commit good results, reset bad ones
+  5. Appends summaries to log.md
+  6. Optionally invokes agent to propose next experiment
+  7. Checks stop conditions -> disables cron if met
 """
 
 import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -34,6 +36,10 @@ AGENT_BIN = os.environ.get("AGENT_BIN", "agent")
 AGENT_MAX_LOG_LINES = int(os.environ.get("AGENT_MAX_LOG_LINES", "50"))
 AGENT_TIMEOUT_SEC = int(os.environ.get("AGENT_TIMEOUT_SEC", "300"))
 MAX_CONSECUTIVE_FAILURES = int(os.environ.get("MAX_CONSECUTIVE_FAILURES", "5"))
+TRAIN_TIME_BUDGET_SEC = int(os.environ.get("TRAIN_TIME_BUDGET_SEC", "0"))
+GIT_EXPERIMENT_MGMT = os.environ.get("GIT_EXPERIMENT_MGMT", "false").lower() == "true"
+BEST_METRIC_FILE = Path(os.environ.get("BEST_METRIC_FILE",
+                                        str(SERVICE_ROOT / ".state" / "best_metric.txt")))
 
 STATE_DIR = SERVICE_ROOT / ".state"
 SCAN_FILE = STATE_DIR / "last_scan.json"
@@ -73,7 +79,6 @@ def save_scan_state(state: dict):
 
 
 def discover_logs() -> list[Path]:
-    """Find all training log files under RESULT_ROOT."""
     logs = []
     for dirpath, _, filenames in os.walk(RESULT_ROOT):
         for fn in filenames:
@@ -83,7 +88,6 @@ def discover_logs() -> list[Path]:
 
 
 def find_new_logs(scan_state: dict) -> list[Path]:
-    """Return logs that are new or modified since last scan."""
     new = []
     for logp in discover_logs():
         key = str(logp)
@@ -102,7 +106,6 @@ def update_scan_state(scan_state: dict, paths: list[Path]):
 
 
 def load_plan_anchors() -> dict[str, dict]:
-    """Parse plan.md, return {anchor: {plan_id, axis, expect, status, ...}}."""
     anchors: dict[str, dict] = {}
     if not PLAN_FILE.exists():
         return anchors
@@ -145,7 +148,95 @@ def map_result_to_plan(result: RunResult, anchors: dict) -> dict | None:
     return anchors.get(result.anchor)
 
 
-def append_log_line(result: RunResult, plan: dict | None):
+# ── Git experiment management ──
+
+def _git(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
+    proc = subprocess.run(
+        ["git"] + cmd,
+        capture_output=True, text=True,
+        cwd=cwd or str(SERVICE_ROOT),
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def load_best_metric() -> float:
+    if BEST_METRIC_FILE.exists():
+        try:
+            return float(BEST_METRIC_FILE.read_text().strip())
+        except ValueError:
+            pass
+    return float("inf") if PRIMARY_METRIC_OP == "lt" else float("-inf")
+
+
+def save_best_metric(val: float):
+    BEST_METRIC_FILE.write_text(str(val))
+
+
+def is_improvement(new_val: float, best_val: float) -> bool:
+    if PRIMARY_METRIC_OP == "lt":
+        return new_val < best_val
+    return new_val > best_val
+
+
+def git_keep(anchor: str):
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    tag = f"exp/{anchor}/{ts}"
+    _git(["tag", tag])
+    print(f"  [git] kept commit, tagged {tag}")
+
+
+def git_discard():
+    rc, out = _git(["rev-parse", "HEAD"])
+    if rc != 0:
+        return
+    rc, out = _git(["log", "--oneline", "-1"])
+    print(f"  [git] discarding: {out}")
+    _git(["reset", "--hard", "HEAD~1"])
+
+
+# ── Training time budget ──
+
+def check_and_kill_overtime_training():
+    """Kill training processes exceeding TRAIN_TIME_BUDGET_SEC."""
+    if TRAIN_TIME_BUDGET_SEC <= 0:
+        return
+
+    try:
+        ps_out = subprocess.check_output(
+            ["ps", "-eo", "pid,etimes,args"], text=True
+        )
+    except subprocess.CalledProcessError:
+        return
+
+    for line in ps_out.strip().splitlines()[1:]:
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, elapsed_s, cmd = parts
+        if "train" not in cmd or "python" not in cmd:
+            continue
+        if "nohup_train.log" not in cmd and "train.py" not in cmd:
+            continue
+        try:
+            elapsed = int(elapsed_s)
+            pid = int(pid_s)
+        except ValueError:
+            continue
+        if elapsed > TRAIN_TIME_BUDGET_SEC:
+            print(f"  [budget] killing PID {pid} (elapsed {elapsed}s > "
+                  f"budget {TRAIN_TIME_BUDGET_SEC}s): {cmd[:80]}")
+            try:
+                os.kill(pid, signal.SIGTERM)
+                time.sleep(2)
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+# ── Log append ──
+
+def append_log_line(result: RunResult, plan: dict | None,
+                    git_action: str = "N/A"):
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     plan_id = plan["plan_id"] if plan else "?"
     axis = plan.get("axis", "?") if plan else "?"
@@ -167,7 +258,7 @@ def append_log_line(result: RunResult, plan: dict | None):
         f"TS={ts};PLAN={plan_id};ANCHOR={result.anchor};"
         f"AXIS={axis};TEST_MAE={result.test_mae or 'N/A'};"
         f"BEST_VAL_MAE={result.best_val_mae or 'N/A'};"
-        f"STATUS={status};HP={result.hp_summary()}"
+        f"STATUS={status};GIT={git_action};HP={result.hp_summary()}"
     )
     with open(LOG_FILE, "a") as f:
         f.write(line + "\n")
@@ -185,7 +276,6 @@ def check_global_stop(results: list[RunResult]) -> bool:
 
 
 def disable_cron():
-    """Remove the auto-research cron entry."""
     try:
         raw = subprocess.check_output(["crontab", "-l"],
                                       stderr=subprocess.DEVNULL, text=True)
@@ -201,7 +291,6 @@ def disable_cron():
 
 
 def build_agent_prompt(new_results: list[tuple[RunResult, dict | None]]) -> str:
-    """Compose the prompt to send to the agent."""
     program_text = PROGRAM_FILE.read_text() if PROGRAM_FILE.exists() else ""
     plan_text = PLAN_FILE.read_text() if PLAN_FILE.exists() else ""
 
@@ -237,16 +326,16 @@ and decide the next action.
 Based on the above:
 1. Update plan.md if needed (add new plan with orthogonal axis, or mark
    completed).
-2. If a promising next experiment is clear, create its config YAML under
-   ${{KERMT_ROOT}}/tlc/configs/ and start training via the whitelisted command.
+2. If a promising next experiment is clear, create its config YAML and/or
+   edit code inside AGENT-EDITABLE blocks, then git commit and start training.
 3. If global stop threshold is met, output the line: STOP_ITERATION=1
-4. Summarize your reasoning and action in 2-3 sentences.
+4. Apply the simplicity criterion: prefer fewer changes for equal gain.
+5. Summarize your reasoning and action in 2-3 sentences.
 """
     return prompt
 
 
 def invoke_agent(prompt: str) -> tuple[bool, str]:
-    """Call cursor agent CLI.  Returns (stop_requested, output)."""
     if not _agent_available():
         prompt_path = STATE_DIR / "last_prompt.txt"
         prompt_path.write_text(prompt)
@@ -274,7 +363,7 @@ def invoke_agent(prompt: str) -> tuple[bool, str]:
 def _agent_available() -> bool:
     try:
         subprocess.run([AGENT_BIN, "--version"],
-                       capture_output=True, timeout=5)
+                       capture_output=True, timeout=10)
         return True
     except Exception:
         return False
@@ -291,6 +380,8 @@ def run_tick():
         print(f"[tick] RESULT_ROOT not found: {RESULT_ROOT}")
         return
 
+    check_and_kill_overtime_training()
+
     scan_state = load_scan_state()
     new_logs = find_new_logs(scan_state)
 
@@ -300,6 +391,7 @@ def run_tick():
 
     print(f"[tick] found {len(new_logs)} new/updated log(s)")
     anchors = load_plan_anchors()
+    best_metric = load_best_metric()
 
     new_results: list[tuple[RunResult, dict | None]] = []
     for logp in new_logs:
@@ -307,12 +399,26 @@ def run_tick():
         if not result.is_complete:
             print(f"  [skip] {result.anchor}: training not complete yet")
             continue
+
         plan = map_result_to_plan(result, anchors)
-        status = append_log_line(result, plan)
+        git_action = "N/A"
+
+        if GIT_EXPERIMENT_MGMT and result.test_mae is not None:
+            if is_improvement(result.test_mae, best_metric):
+                git_action = "keep"
+                git_keep(result.anchor)
+                save_best_metric(result.test_mae)
+                best_metric = result.test_mae
+                print(f"  [git] NEW BEST: {result.test_mae}")
+            else:
+                git_action = "discard"
+                print(f"  [git] no improvement ({result.test_mae} vs best {best_metric})")
+
+        status = append_log_line(result, plan, git_action)
         new_results.append((result, plan))
         pid = plan["plan_id"] if plan else "unmapped"
-        print(f"  [{status}] {result.anchor} → plan={pid} "
-              f"test_mae={result.test_mae}")
+        print(f"  [{status}] {result.anchor} -> plan={pid} "
+              f"test_mae={result.test_mae} git={git_action}")
 
     update_scan_state(scan_state, new_logs)
     save_scan_state(scan_state)

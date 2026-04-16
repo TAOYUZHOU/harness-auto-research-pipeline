@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.egg-info/
 .env
+demo/results/
+demo/*.csv
+demo/*.pt

@@ -5,6 +5,18 @@ the KERMT (GROVER-base) framework.  Your actions are bounded by this document.
 
 ---
 
+## Simplicity criterion
+
+**All else being equal, simpler is better.**  A small metric improvement that
+adds ugly complexity is not worth it.  Conversely, removing code/config and
+getting equal or better results is a great outcome — that is a simplification
+win.  When evaluating whether to keep a change, weigh the complexity cost
+against the improvement magnitude.  A 0.001 MAE improvement that adds 30
+lines of hacky code?  Probably not worth it.  A 0.001 MAE improvement from
+deleting code?  Definitely keep.
+
+---
+
 ## What you CAN do
 
 1. **Edit `plan.md`** — add new YAML plan blocks or update `status` of
@@ -20,21 +32,33 @@ the KERMT (GROVER-base) framework.  Your actions are bounded by this document.
        > tlc/results/<dir>/nohup_train.log 2>&1 &
    ```
    or the `train_c_v3_v4.py` / `train_bidirectional_c_v1.py` variants with
-   the same pattern.
+   the same pattern.  For the demo: `python demo/train.py`.
 4. **Create new YAML config files** under `${KERMT_ROOT}/tlc/configs/` —
    they must follow the schema of existing configs.
 5. **Read any file** under `${RESULT_ROOT}`, `${KERMT_ROOT}/tlc/configs/`,
    `${SERVICE_ROOT}`.
+6. **Edit Python code ONLY inside `# AGENT-EDITABLE-BEGIN` / `# AGENT-EDITABLE-END` blocks.**
+   These blocks are explicitly marked in the following files:
+   - `${KERMT_ROOT}/tlc/scripts/c_v3_c_v4_model.py`
+   - `${KERMT_ROOT}/tlc/scripts/train_c_v3_v4.py`
+   - `demo/model.py` (demo only)
+
+   Rules for code edits:
+   - You MUST NOT modify anything outside these markers.
+   - Every code edit MUST be `git commit`-ed BEFORE training starts.
+   - If the result is worse or crashes, the commit MUST be `git reset --hard`
+     back to the previous good commit.
+   - Keep diffs small and focused (one hypothesis per commit).
 
 ## What you CANNOT do
 
-- Modify `${KERMT_ROOT}/kermt/` (model source code) or any `*.py` training
-  script.  Config-level tuning only.
+- Modify `${KERMT_ROOT}/kermt/` (core GNN source code).
+- Edit Python code outside `AGENT-EDITABLE` blocks.
 - Run arbitrary shell commands beyond the whitelisted training entry points.
 - Delete or overwrite existing result directories.
 - Install or remove Python packages.
 - Modify `program.md` itself.
-- Push to git remotes or modify git history.
+- Push to git remotes or rewrite published git history.
 
 ---
 
@@ -64,10 +88,35 @@ directory.  Key fields: `max_lr`, `init_lr`, `final_lr`, `weight_decay`,
 
 ---
 
+## Training time budget
+
+If `TRAIN_TIME_BUDGET_SEC` is set in `env.sh` (e.g. `600` for 10 minutes),
+the service will kill any training process that exceeds this wall-clock limit.
+Set to `0` or leave unset to let training run to completion (default).
+
+This is useful for rapid iteration: short budget = many experiments overnight.
+
+---
+
+## Git experiment management
+
+The service manages experiments via git:
+
+- **Before training**: `git commit` all pending changes (config + code edits).
+- **After training**:
+  - If the primary metric **improves** (or meets plan expect): **keep** the
+    commit.  Tag it `exp/<anchor>/<timestamp>`.
+  - If the metric is **worse or equal**: `git reset --hard HEAD~1` to discard.
+  - If training **crashes**: `git reset --hard HEAD~1`, log as `crash`.
+
+The HEAD of the branch always represents the best-known configuration.
+
+---
+
 ## log.md line format
 
 ```
-TS=<ISO8601>;PLAN=<id>;ANCHOR=<dir>;AXIS=<axis>;TEST_MAE=<float>;BEST_VAL_MAE=<float>;STATUS=<ok|below_expect|crash|unmapped>;HP=<key=val,...>
+TS=<ISO8601>;PLAN=<id>;ANCHOR=<dir>;AXIS=<axis>;TEST_MAE=<float>;BEST_VAL_MAE=<float>;STATUS=<ok|below_expect|crash|unmapped>;GIT=<keep|discard|crash>;HP=<key=val,...>
 ```
 
 ---
@@ -95,3 +144,5 @@ When proposing a new plan:
   architectural variants).
 - Keep `intent` to one sentence.
 - Prefer smaller, testable hypotheses over sweeping changes.
+- Apply the **simplicity criterion**: if two plans would achieve similar
+  results, prefer the one with fewer moving parts.
