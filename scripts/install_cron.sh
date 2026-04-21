@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install or remove the auto-research cron job.
+# Install or remove the HARP cron job.
 # Usage:
 #   install_cron.sh install   — add cron entry + set iteration_active=true
 #   install_cron.sh remove    — remove cron entry + set iteration_active=false
@@ -9,8 +9,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/../env.sh"
 
-TAG="# auto-research-service"
-TICK_CMD="cd ${SERVICE_ROOT} && source env.sh && /usr/bin/python3 scripts/poll_tick.py >> .state/tick.log 2>&1 ${TAG}"
+: "${SERVICE_ROOT:?SERVICE_ROOT not set}"
+: "${WORK_DIR:?WORK_DIR not set}"
+
+TAG="# harness-auto-research"
+TICK_CMD="cd ${SERVICE_ROOT} && source env.sh && /usr/bin/python3 scripts/poll_tick.py >> ${WORK_DIR}/.state/tick.log 2>&1 ${TAG}"
 
 ACTION="${1:-status}"
 
@@ -29,8 +32,12 @@ ensure_cron_running() {
 
 case "$ACTION" in
     install)
+        if [[ ! -d "$WORK_DIR/.state" ]]; then
+            echo "[ERROR] Workspace not initialized. Run: bash scripts/init_workspace.sh"
+            exit 1
+        fi
+
         ensure_cron_running
-        mkdir -p "${SERVICE_ROOT}/.state"
 
         EXISTING="$(crontab -l 2>/dev/null || true)"
         CLEAN="$(echo "$EXISTING" | grep -v "$TAG" || true)"
@@ -38,9 +45,10 @@ case "$ACTION" in
 
         echo "$CLEAN" | { cat; echo "$ENTRY"; } | crontab -
 
-        echo "true" > "${SERVICE_ROOT}/.state/iteration_active"
+        echo "true" > "${WORK_DIR}/.state/iteration_active"
         echo "[cron] installed: every ${TICK_INTERVAL_MIN:-10} min"
         echo "[cron] iteration_active = true"
+        echo "[cron] tick log: ${WORK_DIR}/.state/tick.log"
         crontab -l
         ;;
 
@@ -49,8 +57,8 @@ case "$ACTION" in
         CLEAN="$(echo "$EXISTING" | grep -v "$TAG" || true)"
         echo "$CLEAN" | crontab -
 
-        echo "false" > "${SERVICE_ROOT}/.state/iteration_active"
-        echo "[cron] removed auto-research entry"
+        echo "false" > "${WORK_DIR}/.state/iteration_active"
+        echo "[cron] removed harness-auto-research entry"
         echo "[cron] iteration_active = false"
         ;;
 
@@ -58,8 +66,11 @@ case "$ACTION" in
         echo "=== crontab ==="
         crontab -l 2>/dev/null || echo "(empty)"
         echo ""
+        echo "=== workspace ==="
+        echo "WORK_DIR: $WORK_DIR"
+        echo ""
         echo "=== iteration_active ==="
-        cat "${SERVICE_ROOT}/.state/iteration_active" 2>/dev/null || echo "(not set)"
+        cat "${WORK_DIR}/.state/iteration_active" 2>/dev/null || echo "(not set)"
         echo ""
         echo "=== cron daemon ==="
         pgrep -x cron >/dev/null 2>&1 && echo "running" || echo "NOT running"

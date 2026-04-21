@@ -1,0 +1,207 @@
+# =============================================================================
+# project.yaml — HARP per-project personalization
+# =============================================================================
+# This is the SOLE place inside repo A (SERVICE_ROOT) where project-specific
+# values live. It is read in two situations only:
+#
+#   (1) `init_workspace.sh` — reads it ONCE at workspace creation to render the
+#       project-agnostic templates in A into a fully-populated workspace B.
+#   (2) `env.sh`            — reads ONLY `workspace.dir` from it as the bootstrap
+#       pointer to where B lives. Everything else at runtime is read from
+#       B/harness.yaml (which is generated from this file at init time, but
+#       owned by B thereafter — edit B/harness.yaml to tweak runtime config,
+#       and only re-touch this file when bootstrapping a NEW workspace from A).
+#
+# Once init has completed, repo B is fully decoupled from this file. Editing
+# project.yaml afterwards has no effect on a live B until you re-init.
+#
+# Schema is grouped by "what it eventually becomes inside B":
+#   harness:    -> rendered into B/harness.yaml (one section per top-level key)
+#   userprompt: -> rendered into B/userprompt.yaml (rules + notes)
+#   cursorrules:-> rendered into B/.cursorrules (with ${KERMT_ROOT} substitution)
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# harness.* — exactly the structure of B/harness.yaml. init_workspace.sh
+# writes this section verbatim (with a leading auto-generated banner) to
+# B/harness.yaml.
+# -----------------------------------------------------------------------------
+harness:
+
+  # -- Target codebase(s) to optimise --
+  targets:
+    - name: KERMT
+      repo_path: /root/autodl-tmp/taoyuzhou/KERMT
+      result_path: /root/autodl-tmp/taoyuzhou/KERMT/tlc/results
+      editable_files:
+        - tlc/scripts/c_v3_c_v4_model.py
+        - tlc/scripts/train_c_v3_v4.py
+      config_dir: tlc/configs
+      agent_addition_dir: add_by_HARP
+      log_glob: nohup_train.log
+      config_glob: effective_config.yaml
+      baseline_anchor: c_v4_d2_datav2_ep200_es50_bs128
+      primary_metric: best_val_mae
+      metric_op: lt              # lt = lower is better
+      stop_threshold: 0.055      # baseline 0.0662 → ~17% improvement target
+
+  # -- Agent runtime --
+  agent:
+    bin: agent
+    model: ""                    # empty = account default
+    timeout_sec: 300
+    max_log_lines: 50
+    memory_tail_blocks: 5        # number of recent ## EXP_ID: blocks to inject
+    flags:
+      - "--approve-mcps"
+      - "--trust"
+
+  # -- Tools available to the agent --
+  tools:
+    gitnexus:
+      enabled: true
+      package: "gitnexus@1.3.11" # last KuzuDB-based release; GLIBC 2.35 OK
+      auto_reindex: true
+      reindex_on: git_head_change
+      analyze_timeout_sec: 600
+    node_bin: ""                 # auto-detect from PATH or cursor-server
+
+  # -- Workspace --
+  workspace:
+    dir: /root/autodl-tmp/taoyuzhou/harp-workspace
+    git_experiment_mgmt: true
+
+  # -- Schedule & safety --
+  schedule:
+    tick_interval_min: 15
+    max_consecutive_failures: 5
+    train_time_budget_sec: 0     # 0 = no per-process wall-clock limit
+    max_cycle: 20                # 0 = unlimited
+    stop_protocol: graceful      # graceful | hard
+
+  # -- Workspace remote (optional GitHub backup of repo B) --
+  workspace_remote:
+    mode: none                   # auto | manual | none
+    org: ""                      # gh org/user, only used when mode=auto
+    visibility: private          # private | public, only used when mode=auto
+    push_on: keep                # keep | every_tick | never
+
+# -----------------------------------------------------------------------------
+# userprompt.* — rendered into B/userprompt.yaml. The rules below are this
+# project's natural-language instructions; the agent translates them into
+# numbered HARD CONSTRAINTs inside program.md USER-INJECTED on first tick.
+# -----------------------------------------------------------------------------
+userprompt:
+  version: 1
+
+  rules:
+    # -- Forbidden experimental directions ------------------------------------
+    - "不要采取用已 fine-tune 过 Rf 的 GROVER 替换 grover_base 的策略。"
+    - "不要在 transformer block 上做 dropout 的 hyperparameter sweep,认为没用。"
+
+    # -- Data / leakage constraints -------------------------------------------
+    - >
+      data_v2_cleaned 的 train/val/test 已经按 SMILES 来源文献切分,三个数据
+      集的 Rf 边际分布有差异;任何企图把验证/测试集的 Rf 拉回 train 分布对齐
+      的方案一律拒绝(domain leakage)。也不要在 train 集上做"按 Rf 分布
+      重采样"以伪造平衡。
+
+    # -- Baseline & framing ---------------------------------------------------
+    - >
+      起始基线是 c_v4_d2_datav2_ep200_es50_bs128,best_val_mae=0.0662
+      (epoch 111)。所有新实验必须在 plan.md 的 motivation 段明确说明相对
+      它的改动是什么(diff in editable_files / new YAML / new file under
+      add_by_HARP/),而不是泛泛说"提升性能"。
+
+    # -- Optimisation focus ---------------------------------------------------
+    - >
+      主要矛盾是过拟合 + 域泛化,不是欠拟合:baseline train_loss≈0.021 vs
+      val_mae≈0.066 的 ~3× gap,且 50 epoch 内 val 不降。优先方向是鲁棒
+      loss、数据增广、encoder 局部 freeze、weight_decay/lr 调度;不优先
+      增大模型容量。
+
+    # -- Training budget ------------------------------------------------------
+    - >
+      每个新实验 epochs<=200 + early_stop_epoch=50,不要无限延长训练。
+      若一次实验 wall-clock 超过 baseline 的 2 倍(≈ 16h),视作预算超支
+      并 git_discard。
+
+  notes: |
+    Baseline 训练时长:161 epoch * ~175s/epoch ≈ 8 小时(单卡)。
+    早停发生在 epoch 161,best 在 epoch 111,说明后 50 epoch 完全是 plateau。
+    loss 曲线特征:train_loss 从 0.20→0.021 平滑下降,val_mae 在 epoch 50
+    以后基本横盘在 0.066-0.069 之间,典型的"过拟合 + 标签噪声共存"形态
+    (Rf ∈ [0,1],标签实测噪声 ~0.02-0.03)。
+
+    当前 train_c_v3_v4.py 不评估 test split,因此 primary_metric 暂定
+    best_val_mae。等训练脚本扩展后再切回 overall_scaffold_balanced_test_mae。
+
+# -----------------------------------------------------------------------------
+# cursorrules.* — rendered into B/.cursorrules. Free-form per-project context
+# for the cursor-agent CLI. ${TOKENS} below are substituted at init time:
+#   ${KERMT_ROOT}    -> harness.targets[0].repo_path
+#   ${SERVICE_ROOT}  -> the absolute path of repo A
+#   ${WORK_DIR}      -> harness.workspace.dir
+#
+# `header` is the static description; `dynamic_scan` is `true` if init should
+# also run scripts/generate_context.py to append "available scripts / configs
+# / top results" tables to .cursorrules. Set to `false` for a stable header.
+# -----------------------------------------------------------------------------
+cursorrules:
+  dynamic_scan: true
+  header: |
+    # Auto-Research Workspace Rules
+    # AUTO-GENERATED by init_workspace.sh from meta_info/project.yaml.
+    # Edits here are erased on the next re-init or generate_context.py run.
+
+    ## You are the auto-research agent for KERMT TLC (Thin-Layer Chromatography Rf prediction).
+
+    ## Project layout (absolute paths)
+
+    - **Template (read-only):** `${SERVICE_ROOT}`
+      - `program.md` — your constraints (injected into your prompt each tick)
+      - `scripts/` — orchestration code (do not edit)
+      - `meta_info/project.yaml` — initial personalization (read once at init)
+
+    - **Workspace (this directory):** `${WORK_DIR}`
+      - `plan.md` — experiment plan registry (you update this)
+      - `log.md` — experiment result log (appended by the service + you)
+      - `memory.md` — narrative journal (one block per closed experiment)
+      - `harness.yaml` — runtime config (canonical at runtime)
+      - `.state/` — runtime bookkeeping (do not edit manually)
+
+    - **KERMT project:** `${KERMT_ROOT}`
+      - `kermt/` — core GNN library (DO NOT MODIFY)
+      - `pretrained_models/grover_base.pt` — pretrained GROVER encoder weights
+      - `tlc/scripts/` — training & evaluation scripts
+      - `tlc/configs/` — YAML experiment configs (you create new ones here)
+      - `tlc/data/data_v2_cleaned/` — canonical dataset (train/val/test sequences)
+      - `tlc/results/<experiment_name>/` — training outputs (logs, checkpoints, plots)
+
+    ## Primary metric
+
+    **MAE** (lower is better). The service tracks `best_val_mae` (per harness.yaml
+    targets[0].primary_metric); switch to `overall_scaffold_balanced_test_mae` once
+    train_c_v3_v4.py evaluates the test split.
+
+    ## AGENT-EDITABLE code regions
+
+    You may ONLY edit code between `# AGENT-EDITABLE-BEGIN` and `# AGENT-EDITABLE-END`
+    markers in (or anywhere in the file if no such marker pair exists; per program.md §7):
+    - `${KERMT_ROOT}/tlc/scripts/c_v3_c_v4_model.py`
+    - `${KERMT_ROOT}/tlc/scripts/train_c_v3_v4.py`
+
+    ## Workflow for proposing an experiment
+
+    1. Read `plan.md` and `log.md` to understand what has been tried
+    2. Identify an orthogonal axis to explore
+    3. Create a new config YAML in `${KERMT_ROOT}/tlc/configs/`
+    4. Optionally edit code in AGENT-EDITABLE blocks
+    5. `git add -A && git commit` in the KERMT repo
+    6. Start training:
+       ```bash
+       cd ${KERMT_ROOT} && nohup python tlc/scripts/train_c_v3_v4.py \
+         --config tlc/configs/<your_config>.yaml \
+         > tlc/results/<dir>/nohup_train.log 2>&1 &
+       ```
+    7. Update `plan.md` with the new plan entry

@@ -1,0 +1,13 @@
+{
+  "name": "harness-auto-research",
+  "version": "0.2.0",
+  "private": true,
+  "description": "HARP: an agent-driven harness for autonomous ML experiment optimisation",
+  "engines": {
+    "node": ">=20"
+  },
+  "comments": {
+    "gitnexus": "v1.3.11 pinned (last KuzuDB-based release, glibc 2.35-compatible). v1.4.x uses LadybugDB which needs glibc >=2.38."
+  },
+  "displayName": "HARP \u2014 Harness for Auto-Research Pipelines"
+}

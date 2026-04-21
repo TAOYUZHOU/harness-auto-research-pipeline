@@ -1,50 +1,79 @@
-# Auto-Research Plan Registry
+# HARP plan registry — TEMPLATE
 
-# Global stop condition
-# ---
-# global_stop:
-#   metric: overall_scaffold_balanced_test_mae
-#   op: lt
-#   threshold: 0.04
+This file in SERVICE_ROOT is the **template** copied into every new
+workspace. The real, project-specific plans live in WORK_DIR/plan.md;
+the agent edits that copy on every tick (registers new plans, marks
+them `running`/`completed`/`abandoned`).
+
+The harness reads the global stop condition from
+WORK_DIR/harness.yaml:
+
+    targets[].primary_metric
+    targets[].metric_op           (lt | gt)
+    targets[].stop_threshold
+
+so plans only need to declare per-plan target thresholds (a sub-goal
+on the way to the global threshold).
+
+## Convention
+
+Each plan is a YAML block separated by `---`. Required fields:
+
+| field | meaning |
+|---|---|
+| `PLAN_ID` | unique short id (`p1`, `p2`, … or descriptive snake_case) |
+| `anchor` | result-dir name the agent will create when this plan runs. Must be unique across plan.md + log.md. |
+| `axis` | one-word handle for the axis being explored. Two `pending`/`running` plans MUST NOT share an axis (orthogonality rule). |
+| `status` | `pending` \| `running` \| `completed` \| `abandoned` |
+| `metric`, `op`, `threshold` | per-plan success criterion (sub-goal). |
+| `motivation` | WHY (must cite a prior `EXP_ID`, a `userprompt.yaml` rule, or a `log.md` observation — see `program.md` §"Plan generation rules"). |
+| `expect` | mirror of `metric`/`op`/`threshold` for the harness to validate. |
+
+## Lifecycle
+
+1. Agent (or this template) registers a plan with `status: pending`.
+2. When the agent picks the plan to run, it flips `status: running`
+   and starts training.
+3. parse_log writes the result to `log.md`. The agent reads it,
+   judges keep/discard against `expect.threshold`, and flips
+   `status: completed` (kept) or `abandoned` (rejected, exhausted,
+   or superseded).
+4. When `## EXP_ID:` block lands in `memory.md`, the corresponding
+   plan must already be in `completed` or `abandoned` state.
+
+## Seeding
+
+This template ships with **one example plan** (below) so the agent
+has a starting point on the very first tick of a fresh workspace.
+Replace it with real plans for your project before running
+`quickstart.sh`, OR leave it in place — the agent will register its
+own first plan during the first non-preflight tick anyway, citing
+your `userprompt.yaml` rules + the baseline numbers from `memory.md`.
 
 ---
 
-### PLAN_ID: P0
-anchor: with_features_v1_dirty
-axis: baseline
-intent: Grover finetune with 21-dim solvent+descriptor features, default hyperparams
+### PLAN_ID: p1_example
+anchor: <baseline_anchor>__<short_descriptive_suffix>
+axis: <one_word_axis_handle>
+status: pending
+metric: <primary_metric_from_harness_yaml>
+threshold: <number_better_than_baseline_but_short_of_global_stop_threshold>
+op: lt                                  # or gt, must match metric_op
+orthogonal_to: []                       # other PLAN_IDs this plan must not overlap with
+expand: 1                               # 1 = single point experiment; >1 = sweep size
+motivation: |
+  REPLACE THIS BLOCK before running. A good motivation:
+    - Cites the baseline (EXP_ID = <baseline_anchor>__BASELINE) and
+      its concrete numbers (e.g. "best_val_mae=X at epoch Y, train
+      loss converged to Z by epoch W").
+    - Cites at least one rule in WORK_DIR/userprompt.yaml that this
+      plan respects or directly addresses.
+    - Names the EXACT code/config surface to be changed (which
+      editable_files file, which config field, or which new file
+      under add_by_HARP/).
+    - Explains WHY this is the cheapest, most informative orthogonal
+      probe to try next — not "improve performance".
 expect:
-  metric: overall_scaffold_balanced_test_mae
-  op: lt
-  threshold: 0.08
-orthogonal_to: []
-expand: 1
-status: completed
-
----
-
-### PLAN_ID: P1
-anchor: with_features_grover_scratch_datav2_ep200_es50_bs128
-axis: data_version_and_pretrain
-intent: Grover from pretrained base (not finetuned ckpt) on data_v2_cleaned, ep200 es50
-expect:
-  metric: overall_scaffold_balanced_test_mae
-  op: lt
-  threshold: 0.075
-orthogonal_to: [P0]
-expand: 1
-status: running
-
----
-
-### PLAN_ID: P2
-anchor: c_v3_vector_datav2_ep200_es100_bs128
-axis: architecture_vector_regression
-intent: Single-head T-dim Rf vector output, no sequential decoding, pure parallel regression
-expect:
-  metric: overall_scaffold_balanced_test_mae
-  op: lt
-  threshold: 0.08
-orthogonal_to: [P0, P1]
-expand: 1
-status: completed
+  metric: <primary_metric_from_harness_yaml>
+  op: lt                                # mirror of `op` above
+  threshold: <same_number_as_above>

@@ -1,8 +1,24 @@
-.state/
+# ── Engine internals ──────────────────────────────────────────────
+node_modules/
 __pycache__/
 *.pyc
-*.egg-info/
-.env
+
+# ── Workspace (B) artifacts that may surface here during dev/test ─
+# .state/ holds runtime bookkeeping (cycle counter, tick.log, locks,
+# sha256 caches). It legitimately exists only inside ${WORK_DIR}, but
+# git-ignore at A's root is a safety net in case of stray test runs.
+.state/
+
+# ── Stale artifact from old generate_context.py ───────────────────
+# The old version of scripts/generate_context.py wrote a copy of
+# .cursorrules back into A as `workspace.cursorrules`. The new version
+# only writes into B/.cursorrules. Ignored to keep the artifact from
+# coming back if anyone reverts the script.
+workspace.cursorrules
+
+# ── Demo training artifacts (regenerable) ─────────────────────────
+# demo/ ships sample data + scripts so users can run a no-GPU demo,
+# but the actual training output (logs, checkpoints) is regenerated
+# every run; don't commit it.
 demo/results/
-demo/*.csv
-demo/*.pt
+demo/__pycache__/

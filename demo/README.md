@@ -1,12 +1,12 @@
 # Demo — Self-contained pipeline validation
 
-A minimal, synthetic example to verify the auto-research-service pipeline
+A minimal, synthetic example to verify the harness-auto-research pipeline
 without needing KERMT or GPU training.
 
 ## Quick start
 
 ```bash
-cd auto-research-service
+cd harness-auto-research
 
 # 1. Generate synthetic TLC-like data (500 train, 100 val, 100 test)
 python3 demo/generate_data.py

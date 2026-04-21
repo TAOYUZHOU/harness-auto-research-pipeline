@@ -53,7 +53,7 @@ flowchart LR
 单仓库或单目录下集中管理（路径均可环境变量覆盖）：
 
 ```
-auto-research-service/        # 或放在 KERMT/tlc/ 旁
+harness-auto-research/        # 或放在 KERMT/tlc/ 旁
 ├── program.md                # 硬约束：可改哪些文件、命令白名单、指标名
 ├── plan.md                   # 极简实验意图 + 正交轴 + 预期
 ├── log.md                    # 极简结果摘要（追加）
@@ -296,7 +296,7 @@ service cron start || /usr/sbin/cron
 
 ## 16. 来自 `autoresearch/` 可直接利用的「轮子」
 
-以下指 **仓库** [`autoresearch`](https://github.com/karpathy/autoresearch)（你本机路径 `autoresearch/`），与 **auto-research-service** 目标对齐的部分；**不能**直接拿来跑 KERMT，但可 **复用模式与片段**。
+以下指 **仓库** [`autoresearch`](https://github.com/karpathy/autoresearch)（你本机路径 `autoresearch/`），与 **harness-auto-research** 目标对齐的部分；**不能**直接拿来跑 KERMT，但可 **复用模式与片段**。
 
 | 资产 | 可直接怎么用 |
 |------|----------------|
@@ -313,7 +313,7 @@ service cron start || /usr/sbin/cron
 | `train.py` / `prepare.py` 具体实现 | 面向 **LLM 预训练**（`val_bpb`、BPE、固定 5min），与 TLC 回归无关。 |
 | `~/.cache/autoresearch` 数据管线 | 领域不同。 |
 
-**你仓库内额外文档**：`autoresearch/KERMT_EXAMPLE.md`（若保留）可作为 **把 autoresearch 工作流映射到 KERMT** 的文字说明，与 auto-research-service 的 `plan.md`/`log.md` 设计互补，但 **不是可执行代码**。
+**你仓库内额外文档**：`autoresearch/KERMT_EXAMPLE.md`（若保留）可作为 **把 autoresearch 工作流映射到 KERMT** 的文字说明，与 harness-auto-research 的 `plan.md`/`log.md` 设计互补，但 **不是可执行代码**。
 
 ---
 
