@@ -328,6 +328,190 @@ def git_discard():
     _git(["reset", "--hard", "HEAD~1"])
 
 
+# ── In-flight log scanning (F3) ──
+
+# Default regex captures KERMT's epoch-line format:
+#   "Epoch: 0042 ...  mae_val: 0.0832 ..."
+# Override per target via harness.yaml::targets[].inflight_pattern  (re_metric)
+# and ::targets[].inflight_metric_name.
+_INFLIGHT_DEFAULT_RE = (
+    r"Epoch:\s*(?P<epoch>\d+)\b.*?mae_val:\s*(?P<metric>[0-9.]+)"
+)
+
+
+def _scan_inflight_log(path: Path, *, pattern: str, lower_is_better: bool
+                       ) -> dict | None:
+    """Parse an in-flight training log.  Returns None if the log has no
+    epoch-line matches (training hasn't produced its first val epoch).
+    Otherwise returns:
+        {
+          "anchor": <run-dir name>,
+          "log": <abs path>,
+          "epochs": <int>,           # number of validated epochs seen
+          "last_epoch": <int>,
+          "best": <float>,           # best metric so far
+          "best_epoch": <int>,
+          "plateau_epochs": <int>,   # epochs since best_epoch with |Δbest| < 0.005
+          "mtime": <float>,          # log's last write time (epoch seconds)
+        }"""
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return None
+    rx = re.compile(pattern)
+    rows: list[tuple[int, float]] = []
+    for m in rx.finditer(text):
+        try:
+            ep = int(m.group("epoch"))
+            mv = float(m.group("metric"))
+        except (ValueError, IndexError):
+            continue
+        rows.append((ep, mv))
+    if not rows:
+        return None
+    last_ep, _ = rows[-1]
+    if lower_is_better:
+        best_idx = min(range(len(rows)), key=lambda i: rows[i][1])
+    else:
+        best_idx = max(range(len(rows)), key=lambda i: rows[i][1])
+    best_ep, best_val = rows[best_idx]
+    # plateau = epochs after best_idx with |delta vs best| < 0.005
+    plateau = 0
+    for ep, mv in rows[best_idx + 1:]:
+        if abs(mv - best_val) < 0.005:
+            plateau += 1
+        else:
+            plateau = 0
+    return {
+        "anchor": path.parent.name,
+        "log": str(path),
+        "epochs": len(rows),
+        "last_epoch": last_ep,
+        "best": round(best_val, 6),
+        "best_epoch": best_ep,
+        "plateau_epochs": plateau,
+        "mtime": path.stat().st_mtime,
+    }
+
+
+def _is_log_completed(path: Path) -> bool:
+    """A log is 'completed' if it ends with an early-stop or final-epoch
+    summary, or hasn't been touched in >30 min.  Used to skip in-flight
+    scanning for finished runs (those are handled by find_new_logs)."""
+    try:
+        st = path.stat()
+    except OSError:
+        return True
+    # Stale logs (>30 min idle) are considered done — training crashed
+    # or finished without writing the usual marker.
+    if time.time() - st.st_mtime > 1800:
+        return True
+    try:
+        # cheap tail read
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 8192))
+            tail = f.read().decode(errors="ignore")
+    except OSError:
+        return False
+    for marker in (
+        "Training finished", "Best epoch:", "Early stopping",
+        "training done", "Final test"
+    ):
+        if marker in tail:
+            return True
+    return False
+
+
+def collect_inflight_runs() -> list[dict]:
+    """Scan every results subdir for in-flight runs and return their
+    per-run snapshot dicts (see _scan_inflight_log).  Empty list if
+    nothing is in flight or RESULT_ROOT is missing."""
+    if not _training_in_progress():
+        return []
+    out: list[dict] = []
+    pattern = _INFLIGHT_DEFAULT_RE
+    metric_name = "mae_val"
+    lower_is_better = (PRIMARY_METRIC_OP == "lt")
+    # Allow per-target override
+    for t in HARNESS.get("targets", []) or []:
+        if t.get("inflight_pattern"):
+            pattern = t["inflight_pattern"]
+        if t.get("inflight_metric_name"):
+            metric_name = t["inflight_metric_name"]
+    for logp in discover_logs():
+        if _is_log_completed(logp):
+            continue
+        snap = _scan_inflight_log(logp,
+                                  pattern=pattern,
+                                  lower_is_better=lower_is_better)
+        if snap:
+            snap["metric_name"] = metric_name
+            out.append(snap)
+    return out
+
+
+def emit_inflight_log_md(inflight: list[dict]):
+    """Append in-flight snapshots to log.md *only when meaningful change
+    has occurred since the last emission* (best improved, OR ≥5 new
+    epochs).  Tracked in .state/inflight_emit.json so we don't spam
+    log.md every tick."""
+    if not inflight:
+        return
+    state_file = STATE_DIR / "inflight_emit.json"
+    try:
+        prev = json.loads(state_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        prev = {}
+    new_state: dict = dict(prev)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    new_lines: list[str] = []
+    for snap in inflight:
+        key = snap["anchor"]
+        prev_snap = prev.get(key, {})
+        improved = (
+            prev_snap.get("best") is None
+            or (PRIMARY_METRIC_OP == "lt" and snap["best"] < prev_snap.get("best", float("inf")))
+            or (PRIMARY_METRIC_OP == "gt" and snap["best"] > prev_snap.get("best", float("-inf")))
+        )
+        epoch_advanced = snap["last_epoch"] - prev_snap.get("last_epoch", -999) >= 5
+        if not (improved or epoch_advanced):
+            continue
+        new_lines.append(
+            f"TS={ts};PLAN=?;ANCHOR={snap['anchor']};AXIS=?;"
+            f"TEST_MAE=N/A;BEST_VAL_MAE={snap['best']};"
+            f"STATUS=in_progress;GIT=N/A;"
+            f"HP=epochs={snap['last_epoch']},best_epoch={snap['best_epoch']},"
+            f"plateau_epochs={snap['plateau_epochs']}"
+        )
+        new_state[key] = {"best": snap["best"], "last_epoch": snap["last_epoch"]}
+    if new_lines:
+        with open(LOG_FILE, "a") as f:
+            for l in new_lines:
+                f.write(l + "\n")
+        state_file.write_text(json.dumps(new_state, indent=2))
+
+
+def format_inflight_for_prompt(inflight: list[dict]) -> str:
+    if not inflight:
+        return ""
+    lines = ["=== IN-FLIGHT TRAINING (live log scan, NOT yet committed) ==="]
+    for snap in inflight:
+        flag = ""
+        if snap["plateau_epochs"] >= 10:
+            flag = "   ⚠ PLATEAU"
+        lines.append(
+            f"  - {snap['anchor']}: epoch {snap['last_epoch']} "
+            f"(best {snap['metric_name']}={snap['best']} @ ep {snap['best_epoch']}, "
+            f"plateau_epochs={snap['plateau_epochs']}){flag}"
+        )
+    lines.append(
+        "Per userprompt rules, plateau_epochs ≥ 10 with no improvement "
+        "is grounds to abandon (manual git_discard + start next plan). "
+        "Do NOT touch a run that is still actively improving."
+    )
+    return "\n".join(lines) + "\n"
+
+
 # ── Training-process detection ──
 
 def _training_in_progress() -> bool:
@@ -786,7 +970,8 @@ def parse_memory_done(agent_output: str) -> list[str]:
     return MEMORY_DONE_RE.findall(agent_output)
 
 
-def build_agent_prompt(new_results: list[tuple[RunResult, dict | None]]) -> str:
+def build_agent_prompt(new_results: list[tuple[RunResult, dict | None]],
+                       inflight: list[dict] | None = None) -> str:
     # Read B/program.md as-is (B owns it after init; A is template-only).
     # If somehow missing, ensure_* falls back to seeding from A — defensive.
     program_text = ensure_workspace_program_initialized()
@@ -961,7 +1146,7 @@ IMPORTANT: You are operating in workspace directory: {WORK_DIR}
 
 === NEW RESULTS THIS TICK ===
 {chr(10).join(results_summary) if results_summary else '(none — see TICK MODE: PROPOSE above)'}
-{propose_hint}
+{propose_hint}{format_inflight_for_prompt(inflight or [])}
 
 Based on the above:
 1. Use GitNexus tools to understand the target codebase before making changes.
@@ -1002,13 +1187,16 @@ def _get_or_create_chat_id() -> str | None:
 def _run_agent_streaming(cmd: list[str], timeout: int) -> tuple[int, str, bool]:
     """Run the agent CLI streaming stdout+stderr to a live file so we
     keep partial output on timeout (subprocess.run discards its buffer
-    on TimeoutExpired).  Returns (returncode_or_-1, output_text,
-    timed_out)."""
-    out_path = STATE_DIR / "last_agent_output.txt"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    on TimeoutExpired).  Returns (returncode_or_-1, raw_text, timed_out).
+
+    Raw text is the full stream-json output (one JSON object per line).
+    Use _parse_agent_stream() to extract the assistant's textual reply
+    + token usage from it."""
+    raw_path = STATE_DIR / "last_agent_stream.jsonl"
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
     rc = -1
-    with open(out_path, "w") as fout:
+    with open(raw_path, "w") as fout:
         proc = subprocess.Popen(
             cmd,
             stdout=fout, stderr=subprocess.STDOUT,
@@ -1023,22 +1211,136 @@ def _run_agent_streaming(cmd: list[str], timeout: int) -> tuple[int, str, bool]:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
-            print(f"[tick] agent timed out after {timeout}s — partial output kept at {out_path}")
+            print(f"[tick] agent timed out after {timeout}s — partial stream kept at {raw_path}")
     try:
-        text = out_path.read_text()
+        text = raw_path.read_text()
     except OSError:
         text = ""
     return rc, text, timed_out
 
 
-def invoke_agent(prompt: str) -> tuple[bool, str]:
+def _parse_agent_stream(raw: str) -> tuple[str, dict]:
+    """Walk the cursor-agent stream-json output.  Returns (assistant_text,
+    usage_dict).  Falls back gracefully if the output is plain text
+    (e.g. older agent versions or `--output-format text`).
+
+    Each line in stream-json is one JSON event.  The agent's textual
+    reply lives in the FINAL `assistant` event whose `message.content`
+    is a single chunk holding the complete answer (deltas are dropped
+    by us — the final aggregated chunk has the full text).  Token
+    usage lives in the `result` event."""
+    if not raw:
+        return "", {}
+    if not raw.lstrip().startswith("{"):
+        # Not JSON — agent ran with text format or stream-json was unsupported.
+        return raw, {}
+
+    assistant_chunks: list[str] = []
+    usage: dict = {}
+    final_result_text = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        et = ev.get("type")
+        if et == "assistant":
+            msg = ev.get("message", {}) or {}
+            for chunk in msg.get("content", []) or []:
+                if chunk.get("type") == "text":
+                    t = chunk.get("text", "")
+                    if t:
+                        assistant_chunks.append(t)
+        elif et == "result":
+            usage = ev.get("usage", {}) or {}
+            r = ev.get("result")
+            if isinstance(r, str):
+                final_result_text = r
+
+    # The cursor-agent stream emits the answer as many small `assistant`
+    # delta events PLUS one final `assistant` event with the complete
+    # text.  The simplest robust merge: prefer the result event's
+    # `result` field (always the full final answer).  If that's absent,
+    # take the longest assistant chunk seen.
+    if final_result_text:
+        text = final_result_text
+    elif assistant_chunks:
+        text = max(assistant_chunks, key=len)
+    else:
+        text = ""
+    return text, usage
+
+
+def _record_usage(usage: dict, *, mode: str, timed_out: bool, cycle: int):
+    """Append a usage record + maintain a rolling summary.  Cheap and
+    robust to missing keys (older agent versions)."""
+    if not usage:
+        return
+    rec = {
+        "ts": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+        "cycle": cycle,
+        "mode": mode,
+        "timed_out": timed_out,
+        "input_tokens": usage.get("inputTokens", 0),
+        "output_tokens": usage.get("outputTokens", 0),
+        "cache_read_tokens": usage.get("cacheReadTokens", 0),
+        "cache_write_tokens": usage.get("cacheWriteTokens", 0),
+    }
+    usage_log = STATE_DIR / "usage.jsonl"
+    usage_log.parent.mkdir(parents=True, exist_ok=True)
+    with open(usage_log, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+    # Recompute rolling summary from the full log so it stays consistent
+    # even if a record was lost.  Cheap: ticks are infrequent.
+    totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0,
+              "ticks": 0, "timed_out_ticks": 0}
+    try:
+        for line in usage_log.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            totals["input"] += int(r.get("input_tokens", 0))
+            totals["output"] += int(r.get("output_tokens", 0))
+            totals["cache_read"] += int(r.get("cache_read_tokens", 0))
+            totals["cache_write"] += int(r.get("cache_write_tokens", 0))
+            totals["ticks"] += 1
+            if r.get("timed_out"):
+                totals["timed_out_ticks"] += 1
+    except OSError:
+        pass
+
+    summary = (
+        f"# HARP token usage summary (last update {rec['ts']})\n"
+        f"ticks_with_usage:    {totals['ticks']}\n"
+        f"timed_out_ticks:     {totals['timed_out_ticks']}\n"
+        f"input_tokens_total:  {totals['input']}\n"
+        f"output_tokens_total: {totals['output']}\n"
+        f"cache_read_total:    {totals['cache_read']}\n"
+        f"cache_write_total:   {totals['cache_write']}\n"
+        f"# avg per tick (input + output, no cache): "
+        f"{(totals['input'] + totals['output']) // max(totals['ticks'], 1)}\n"
+    )
+    (STATE_DIR / "usage_summary.txt").write_text(summary)
+
+
+def invoke_agent(prompt: str, *, mode: str = "tick", cycle: int = 0
+                 ) -> tuple[bool, str]:
     if not _agent_available():
         prompt_path = STATE_DIR / "last_prompt.txt"
         prompt_path.write_text(prompt)
         print(f"[tick] agent not available; prompt saved to {prompt_path}")
         return False, "[dry-run]"
 
+    # stream-json gives us per-event records (assistant deltas + final
+    # result with `usage`).  We always use it now so we can log token
+    # cost per tick and recover partial output on timeout.
     cmd = [AGENT_BIN, "-p", "--force",
+           "--output-format", "stream-json", "--stream-partial-output",
            "--workspace", str(WORK_DIR)]
     for flag in AGENT_FLAGS:
         if flag not in cmd:
@@ -1052,8 +1354,14 @@ def invoke_agent(prompt: str) -> tuple[bool, str]:
 
     cmd.append(prompt)
 
-    rc, output, timed_out = _run_agent_streaming(cmd, AGENT_TIMEOUT_SEC)
+    rc, raw, timed_out = _run_agent_streaming(cmd, AGENT_TIMEOUT_SEC)
+    output, usage = _parse_agent_stream(raw)
     stop = _stop_requested(output)
+
+    # Persist a human-readable copy of just the assistant's reply for
+    # the existing tooling (tail -f, audit, etc.) that expects
+    # last_agent_output.txt to be plain text.
+    (STATE_DIR / "last_agent_output.txt").write_text(output or "[empty]")
 
     # If we were resuming and got nothing useful, retry once with a fresh
     # session.  Resumed sessions can corrupt or accumulate context to the
@@ -1065,6 +1373,7 @@ def invoke_agent(prompt: str) -> tuple[bool, str]:
         except FileNotFoundError:
             pass
         cmd_retry = [AGENT_BIN, "-p", "--force",
+                     "--output-format", "stream-json", "--stream-partial-output",
                      "--workspace", str(WORK_DIR)]
         for flag in AGENT_FLAGS:
             if flag not in cmd_retry:
@@ -1072,8 +1381,17 @@ def invoke_agent(prompt: str) -> tuple[bool, str]:
         if AGENT_MODEL:
             cmd_retry.extend(["--model", AGENT_MODEL])
         cmd_retry.append(prompt)
-        rc, output, timed_out = _run_agent_streaming(cmd_retry, AGENT_TIMEOUT_SEC)
+        rc, raw, timed_out = _run_agent_streaming(cmd_retry, AGENT_TIMEOUT_SEC)
+        output, usage = _parse_agent_stream(raw)
         stop = _stop_requested(output)
+        (STATE_DIR / "last_agent_output.txt").write_text(output or "[empty]")
+
+    _record_usage(usage, mode=mode, timed_out=timed_out, cycle=cycle)
+    if usage:
+        print(f"[tick] usage: in={usage.get('inputTokens',0)} "
+              f"out={usage.get('outputTokens',0)} "
+              f"cache_r={usage.get('cacheReadTokens',0)} "
+              f"cache_w={usage.get('cacheWriteTokens',0)}")
 
     if timed_out:
         return False, output  # partial output retained
@@ -1561,7 +1879,7 @@ def run_preflight():
     }
     ws_snap = _snapshot_repo(WORK_DIR)
 
-    _, agent_output = invoke_agent(prompt)
+    _, agent_output = invoke_agent(prompt, mode="preflight", cycle=0)
 
     if agent_output and agent_output != "[dry-run]":
         (STATE_DIR / "last_preflight_output.txt").write_text(agent_output)
@@ -1636,22 +1954,40 @@ def run_tick():
     scan_state = load_scan_state()
     new_logs = find_new_logs(scan_state)
 
+    # Always scan in-flight logs so we can (a) update log.md with
+    # STATUS=in_progress snapshots and (b) decide whether to wake the
+    # agent for an abandon-on-plateau decision.
+    inflight = collect_inflight_runs()
+    emit_inflight_log_md(inflight)
+    plateaued = [s for s in inflight if s["plateau_epochs"] >= 10]
+    if inflight:
+        print(f"[tick] in-flight: {len(inflight)} run(s), "
+              f"{len(plateaued)} plateaued (≥10 epoch no improvement)")
+
     # Cold-start / propose-mode handling.
     # Reactive-only tick (the original behaviour) deadlocks on a fresh
     # workspace: preflight is forbidden from proposing, ticks only fire
     # on new logs, so without external nudge the loop never starts.
     # Solution: when there are NO new logs AND NO training currently
     # running, fall through to invoke the agent in propose-only mode.
-    # If training IS in flight we still wait — no parallel proposals.
+    # If training IS in flight we wait UNLESS a plateau is detected, in
+    # which case enter monitor mode so the agent can decide abandon.
     propose_mode = False
+    monitor_mode = False
     if not new_logs:
         if _training_in_progress():
-            print("[tick] no new logs; training still in flight — waiting")
-            return
-        print("[tick] no new logs; entering propose mode (no training in flight)")
-        propose_mode = True
+            if plateaued:
+                monitor_mode = True
+                print(f"[tick] no new logs but {len(plateaued)} plateaued "
+                      f"in-flight run(s) — entering monitor mode")
+            else:
+                print("[tick] no new logs; training in flight, no plateau — waiting")
+                return
+        else:
+            print("[tick] no new logs; entering propose mode (no training in flight)")
+            propose_mode = True
 
-    if not propose_mode:
+    if not (propose_mode or monitor_mode):
         print(f"[tick] found {len(new_logs)} new/updated log(s)")
     anchors = load_plan_anchors()
     best_metric = load_best_metric()
@@ -1703,14 +2039,14 @@ def run_tick():
     update_scan_state(scan_state, new_logs)
     save_scan_state(scan_state)
 
-    # In propose mode there's nothing to evaluate — skip results-processing
-    # guards and go straight to agent invocation so it can seed/propose.
-    if not propose_mode and not new_results:
+    # In propose / monitor mode there's nothing to evaluate — skip
+    # results-processing guards and go straight to agent invocation.
+    if not (propose_mode or monitor_mode) and not new_results:
         print("[tick] no completed runs to process")
         return
 
     all_results = [r for r, _ in new_results]
-    if not propose_mode and check_global_stop(all_results):
+    if not (propose_mode or monitor_mode) and check_global_stop(all_results):
         print("[tick] *** GLOBAL STOP THRESHOLD MET ***")
         # No agent ran this tick, so cycle counter is unchanged; capture
         # the final log.md / memory.md state for posterity, then push.
@@ -1721,7 +2057,7 @@ def run_tick():
         return
 
     ensure_gitnexus_index()
-    prompt = build_agent_prompt(new_results)
+    prompt = build_agent_prompt(new_results, inflight=inflight)
     pending_hash = getattr(build_agent_prompt, "_pending_userprompt_hash", "")
 
     # Snapshot every target repo + workspace BEFORE the agent runs, so the
@@ -1733,7 +2069,18 @@ def run_tick():
     }
     ws_snap = _snapshot_repo(WORK_DIR)
 
-    stop_requested, agent_output = invoke_agent(prompt)
+    pending_cycle = load_cycle_count() + 1
+    if propose_mode:
+        invoke_mode = "propose"
+    elif monitor_mode:
+        invoke_mode = "monitor"
+    else:
+        invoke_mode = "tick"
+    stop_requested, agent_output = invoke_agent(
+        prompt,
+        mode=invoke_mode,
+        cycle=pending_cycle,
+    )
 
     cycle = increment_cycle_count()
     print(f"[tick] cycle counter -> {cycle}"

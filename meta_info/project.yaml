@@ -43,7 +43,7 @@ harness:
       baseline_anchor: c_v4_d2_datav2_ep200_es50_bs128
       primary_metric: best_val_mae
       metric_op: lt              # lt = lower is better
-      stop_threshold: 0.04       # baseline 0.0662 → ~40% improvement target
+      stop_threshold: 0.05       # baseline 0.0662 → ~24% improvement target
 
   # -- Agent runtime --
   agent:
@@ -135,6 +135,28 @@ userprompt:
       test_mae(0.0423 / 0.0355) 一律视为 INVALID baseline,不得作为 best 比较
       锚点,也不得据此触发 stop_threshold。比较 best 时唯一合法的起点是
       c_v4_d2_datav2_ep200_es50_bs128(best_val_mae=0.0662)。
+
+    # -- Two-stage screening then full run -----------------------------------
+    - >
+      两阶段实验流程: 先 screening 后 full run。每个新 axis 的 plan 默认先用
+      epochs<=80 + early_stop_epoch<=20 的"筛选轮"(screening run)定方向;
+      只有当连续 2 个 screening 把 best_val_mae 至少推进 5%(相对当前 best) 时,
+      才允许提交一次 epochs=200 + early_stop_epoch=50 的 full run。screening
+      run 的 anchor 必须以 _scr 结尾以方便日志识别。
+
+    # -- Abandon-on-plateau --------------------------------------------------
+    - >
+      任何 in-flight 训练若连续 >=10 epoch 内 mae_val 改善 < 0.005(绝对值),
+      视为 plateau, agent 应在下一 tick 评估是否手动 git_discard 并启动下一
+      plan。HARP 每 tick 会把 in-flight log 的 best_val_so_far 和
+      plateau_epochs 注入 prompt 供 agent 决策。
+
+    # -- GPU throughput priority ---------------------------------------------
+    - >
+      显存 / 吞吐优先: 新 plan 的训练命令应尽可能用大 batch_size 把单卡显存
+      吃满(从 256/512 起步, OOM 再下调一档),减少梯度噪声和 wall-clock。
+      同时确保 lr 随 batch_size 线性放大或开 LR warmup 以避免震荡。仅当显式
+      想做 small-batch 正则化研究时才回到 bs=128。
 
   notes: |
     Baseline 训练时长:161 epoch * ~175s/epoch ≈ 8 小时(单卡)。

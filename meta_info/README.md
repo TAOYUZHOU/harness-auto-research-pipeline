@@ -69,3 +69,106 @@ See `project.yaml` itself for the schema; it is heavily commented.
   into `meta_info/`. That belongs in `program.md`, `check.md`, or scripts.
 - **Never** reference `meta_info/project.yaml` from `B/`. B is decoupled
   from A by design — runtime code reads `B/harness.yaml` only.
+
+---
+
+## Lessons learned (engine-generic patterns)
+
+The following patterns came out of real KERMT iterations and are baked
+into the engine (`scripts/poll_tick.py`, `scripts/install_cron.sh`,
+`env.sh`). They apply to any new project by default — no per-project
+config needed — but are documented here so future authors know **why**
+they exist and don't accidentally undo them.
+
+### 1. Cron must run under bash, not dash
+`source env.sh` and `set -o pipefail` are bash-only. `install_cron.sh`
+wraps the tick command in `bash -lc '...'` because cron's default `/bin/sh`
+is dash on most distros. Symptom if removed: cron fires but `tick.log`
+never appears (silent failure).
+
+### 2. Cold-start propose mode
+A reactive-only loop (only fire on new logs) deadlocks on a fresh
+workspace because preflight is forbidden from proposing. `poll_tick.run_tick()`
+detects "no new logs ∧ no training in flight" and invokes the agent in
+**propose mode** with an explicit hint to register a plan + kick off
+training. Without this, the loop never starts on a fresh `meta_info`.
+
+### 3. Line-anchored marker regexes
+The agent's prose often *describes* its markers ("`STOP_ITERATION=1` is
+**not** emitted") and a substring check (`"STOP_ITERATION=1" in output`)
+yields a false positive that auto-uninstalls cron. All marker checks
+(`STOP_ITERATION`, `PROGRAM_SYNC_DONE`, `MEMORY_DONE`) use
+`re.compile(r"^\s*MARKER=1\s*$", re.MULTILINE)`. Never replace these
+with substring checks.
+
+### 4. Stream agent output to disk
+`subprocess.run(timeout=...)` discards stdout on `TimeoutExpired`, so a
+10-min timeout = zero diagnostic data. Use `_run_agent_streaming()`
+(Popen + redirect to a file). Combined with `--output-format
+stream-json`, partial output is *always* recoverable.
+
+### 5. Token-cost accounting (F2)
+Every agent invocation goes through `_run_agent_streaming()` with
+`--output-format stream-json --stream-partial-output` and the `result`
+event's `usage` dict is appended to `B/.state/usage.jsonl`. A rolling
+summary lives in `B/.state/usage_summary.txt`. This is generic — any
+project that uses the cursor-agent CLI inherits it for free.
+
+### 6. In-flight log scanning + abandon-on-plateau (F3)
+Long-running training (hours per cycle) blocks the loop unless the
+engine can introspect partial progress. `collect_inflight_runs()`
+parses every `nohup_train.log` in `RESULT_ROOT` each tick, extracts
+`(epoch, val_metric)` pairs, computes `best_val_so_far` and
+`plateau_epochs`, and:
+
+- appends a `STATUS=in_progress` line to `log.md` whenever the best
+  improves OR ≥ 5 epochs advance (deduped via
+  `B/.state/inflight_emit.json`);
+- enters **monitor mode** (waking the agent mid-training) when any
+  in-flight run shows `plateau_epochs ≥ 10` so the agent can decide
+  whether to manually `git_discard` and start the next plan.
+
+The default regex captures `Epoch: NNNN ... mae_val: X.XXXX`. If a new
+project uses a different log format, override per target via:
+
+```yaml
+harness:
+  targets:
+    - name: yourproj
+      inflight_pattern: "step (?P<epoch>\\d+) .*loss=(?P<metric>[0-9.]+)"
+      inflight_metric_name: "loss"
+```
+
+### 7. Two-stage screening pattern
+Recommended (but not mandatory) addition to `userprompt.rules` for any
+project where one full training run is expensive (> 1 h):
+
+> Each new axis runs first as a screening cycle (epochs ≤ 80,
+> early_stop_epoch ≤ 20, anchor suffix `_scr`). Only after two
+> consecutive screenings improve `best_val` ≥ 5 % does a full
+> (epochs=200, early_stop=50) run get scheduled.
+
+Combined with the abandon-on-plateau rule, this caps wall-clock per
+unverified direction at ~ 1/4 of a full run.
+
+### 8. Workspace remote auto-create
+Long iterations on remote SSH boxes that may sleep need a Git remote
+backup. `harness.workspace_remote.mode = auto` triggers
+`init_workspace.sh` to create + push to a `gh repo create`-style remote.
+Failure mode: `gh CLI` requires `read:org` for *itself* even when only
+`repo` scope is needed for the API. The escape hatch is a direct
+`curl -X POST https://api.github.com/user/repos` with the user's PAT
+(works with classic PAT + `repo` scope alone).
+
+### 9. Program-constitution hash
+`B/program.md` is the contract; the agent may only edit content inside
+the `<!-- USER-INJECTED-BEGIN/END -->` markers. Preflight records
+`sha256(program.md - USER-INJECTED block)` to
+`B/.state/program_constitution.sha256`, and every tick verifies. Drift
+triggers atomic rollback + `constitution_drift` stop. Never disable.
+
+### 10. SCRIPT_DIR variable hygiene
+`env.sh` is sourced by other scripts. Internal helper variables MUST
+be prefixed with `_HARP_` (e.g. `_HARP_ENV_DIR`) to avoid clobbering
+caller-defined `SCRIPT_DIR`, which silently breaks
+`backup_originals.sh` and friends.
