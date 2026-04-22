@@ -43,13 +43,13 @@ harness:
       baseline_anchor: c_v4_d2_datav2_ep200_es50_bs128
       primary_metric: best_val_mae
       metric_op: lt              # lt = lower is better
-      stop_threshold: 0.055      # baseline 0.0662 → ~17% improvement target
+      stop_threshold: 0.04       # baseline 0.0662 → ~40% improvement target
 
   # -- Agent runtime --
   agent:
     bin: agent
     model: ""                    # empty = account default
-    timeout_sec: 300
+    timeout_sec: 600             # 10 min — propose ticks need extra room when PROGRAM SYNC also pending
     max_log_lines: 50
     memory_tail_blocks: 5        # number of recent ## EXP_ID: blocks to inject
     flags:
@@ -75,8 +75,8 @@ harness:
   schedule:
     tick_interval_min: 15
     max_consecutive_failures: 5
-    train_time_budget_sec: 0     # 0 = no per-process wall-clock limit
-    max_cycle: 20                # 0 = unlimited
+    train_time_budget_sec: 28800 # 8h hard cap per training process (0 = unlimited)
+    max_cycle: 10                # 0 = unlimited
     stop_protocol: graceful      # graceful | hard
 
   # -- Workspace remote (optional GitHub backup of repo B) --
@@ -125,6 +125,16 @@ userprompt:
       每个新实验 epochs<=200 + early_stop_epoch=50,不要无限延长训练。
       若一次实验 wall-clock 超过 baseline 的 2 倍(≈ 16h),视作预算超支
       并 git_discard。
+
+    # -- Invalid historical baselines (different data split) -----------------
+    - >
+      历史实验 with_features_v1_cleaned_finetune5ep_beta_nll 与
+      with_features_v1_dirty_finetune5ep_datav2_ep200_es50_bs128 使用了与当前
+      data_v2_cleaned 不同的数据划分(train/val/test split 不一致),它们在
+      memory.md / log.md 中的 best_val_mae(分别 N/A 和 0.0384)和
+      test_mae(0.0423 / 0.0355) 一律视为 INVALID baseline,不得作为 best 比较
+      锚点,也不得据此触发 stop_threshold。比较 best 时唯一合法的起点是
+      c_v4_d2_datav2_ep200_es50_bs128(best_val_mae=0.0662)。
 
   notes: |
     Baseline 训练时长:161 epoch * ~175s/epoch ≈ 8 小时(单卡)。

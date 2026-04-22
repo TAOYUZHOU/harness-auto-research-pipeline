@@ -328,6 +328,33 @@ def git_discard():
     _git(["reset", "--hard", "HEAD~1"])
 
 
+# ── Training-process detection ──
+
+def _training_in_progress() -> bool:
+    """Return True if any python training process matching the editable_files
+    pattern is currently running.  Used by run_tick() to decide whether to
+    enter propose-mode (seed the next experiment) vs wait for an in-flight
+    run to finish.  False on any error — cheaper to over-propose than to
+    deadlock the loop."""
+    try:
+        ps_out = subprocess.check_output(["ps", "-eo", "args"], text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+    train_scripts: list[str] = []
+    for t in HARNESS.get("targets", []) or []:
+        for ef in t.get("editable_files", []) or []:
+            if ef.endswith(".py") and "train" in os.path.basename(ef).lower():
+                train_scripts.append(os.path.basename(ef))
+    if not train_scripts:
+        train_scripts = ["train_c_v3_v4.py", "train.py"]
+    for line in ps_out.strip().splitlines()[1:]:
+        if "python" not in line:
+            continue
+        if any(s in line for s in train_scripts) or "nohup_train.log" in line:
+            return True
+    return False
+
+
 # ── Training time budget ──
 
 def check_and_kill_overtime_training():
@@ -675,7 +702,20 @@ def verify_program_constitution() -> tuple[bool, str, str]:
 # Heading marker for one entry; used both for parsing and for telling the
 # agent the exact format.
 MEMORY_HEADING_RE = re.compile(r"^##\s+EXP_ID:\s*(\S+)\s*$", re.MULTILINE)
-MEMORY_DONE_RE = re.compile(r"MEMORY_DONE=(\S+)")
+MEMORY_DONE_RE = re.compile(r"^\s*MEMORY_DONE=(\S+)\s*$", re.MULTILINE)
+# Line-anchored marker detection.  We must NOT match the marker when it
+# appears inside an agent's prose (e.g. "STOP_ITERATION=1 is not emitted"
+# inside a paragraph).  Only stand-alone lines count.
+STOP_ITERATION_RE = re.compile(r"^\s*STOP_ITERATION=1\s*$", re.MULTILINE)
+PROGRAM_SYNC_DONE_RE = re.compile(r"^\s*PROGRAM_SYNC_DONE=1\s*$", re.MULTILINE)
+
+
+def _stop_requested(output: str) -> bool:
+    return bool(STOP_ITERATION_RE.search(output or ""))
+
+
+def _program_sync_done(output: str) -> bool:
+    return bool(PROGRAM_SYNC_DONE_RE.search(output or ""))
 
 
 def load_pending_memory() -> dict:
@@ -854,6 +894,20 @@ Items to write THIS tick:
             f"best_val_mae={r.best_val_mae}, plan={pid}"
         )
 
+    propose_hint = ""
+    if not new_results:
+        propose_hint = (
+            "\n=== TICK MODE: PROPOSE ===\n"
+            "No new training results closed this tick AND no training is in "
+            "flight.  Your job THIS tick is to seed/propose the next "
+            "experiment: register a new PLAN_ID in plan.md (or pick an "
+            "existing 'pending' one), create its config YAML and any "
+            "AGENT-EDITABLE edits, git-commit in the target repo, then "
+            "kick off training via the whitelisted nohup pattern from "
+            "program.md.  Do NOT emit STOP_ITERATION unless the global "
+            "stop threshold is genuinely met.\n"
+        )
+
     gitnexus_hint = ""
     if GITNEXUS_ENABLED:
         repo_names = [t["name"] for t in TARGET_REPOS]
@@ -906,7 +960,8 @@ IMPORTANT: You are operating in workspace directory: {WORK_DIR}
 {chr(10).join(log_lines)}
 
 === NEW RESULTS THIS TICK ===
-{chr(10).join(results_summary)}
+{chr(10).join(results_summary) if results_summary else '(none — see TICK MODE: PROPOSE above)'}
+{propose_hint}
 
 Based on the above:
 1. Use GitNexus tools to understand the target codebase before making changes.
@@ -944,6 +999,38 @@ def _get_or_create_chat_id() -> str | None:
     return None
 
 
+def _run_agent_streaming(cmd: list[str], timeout: int) -> tuple[int, str, bool]:
+    """Run the agent CLI streaming stdout+stderr to a live file so we
+    keep partial output on timeout (subprocess.run discards its buffer
+    on TimeoutExpired).  Returns (returncode_or_-1, output_text,
+    timed_out)."""
+    out_path = STATE_DIR / "last_agent_output.txt"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    timed_out = False
+    rc = -1
+    with open(out_path, "w") as fout:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=fout, stderr=subprocess.STDOUT,
+            cwd=str(WORK_DIR),
+        )
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+            print(f"[tick] agent timed out after {timeout}s — partial output kept at {out_path}")
+    try:
+        text = out_path.read_text()
+    except OSError:
+        text = ""
+    return rc, text, timed_out
+
+
 def invoke_agent(prompt: str) -> tuple[bool, str]:
     if not _agent_available():
         prompt_path = STATE_DIR / "last_prompt.txt"
@@ -965,42 +1052,34 @@ def invoke_agent(prompt: str) -> tuple[bool, str]:
 
     cmd.append(prompt)
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True, text=True,
-            timeout=AGENT_TIMEOUT_SEC,
-            cwd=str(WORK_DIR),
-        )
-        output = proc.stdout + proc.stderr
-        stop = "STOP_ITERATION=1" in output
+    rc, output, timed_out = _run_agent_streaming(cmd, AGENT_TIMEOUT_SEC)
+    stop = _stop_requested(output)
 
-        if not output.strip() and chat_id:
-            print("[tick] empty response with --resume, retrying without it")
-            cmd_retry = [AGENT_BIN, "-p", "--force",
-                         "--workspace", str(WORK_DIR)]
-            for flag in AGENT_FLAGS:
-                if flag not in cmd_retry:
-                    cmd_retry.append(flag)
-            if AGENT_MODEL:
-                cmd_retry.extend(["--model", AGENT_MODEL])
-            cmd_retry.append(prompt)
-            proc = subprocess.run(
-                cmd_retry,
-                capture_output=True, text=True,
-                timeout=AGENT_TIMEOUT_SEC,
-                cwd=str(WORK_DIR),
-            )
-            output = proc.stdout + proc.stderr
-            stop = "STOP_ITERATION=1" in output
+    # If we were resuming and got nothing useful, retry once with a fresh
+    # session.  Resumed sessions can corrupt or accumulate context to the
+    # point of stalling; a fresh chat usually unblocks.
+    if (not output.strip() or timed_out) and chat_id:
+        print("[tick] empty/timed-out response with --resume; clearing chat_id and retrying fresh")
+        try:
+            (STATE_DIR / "agent_chat_id.txt").unlink()
+        except FileNotFoundError:
+            pass
+        cmd_retry = [AGENT_BIN, "-p", "--force",
+                     "--workspace", str(WORK_DIR)]
+        for flag in AGENT_FLAGS:
+            if flag not in cmd_retry:
+                cmd_retry.append(flag)
+        if AGENT_MODEL:
+            cmd_retry.extend(["--model", AGENT_MODEL])
+        cmd_retry.append(prompt)
+        rc, output, timed_out = _run_agent_streaming(cmd_retry, AGENT_TIMEOUT_SEC)
+        stop = _stop_requested(output)
 
-        return stop, output
-    except subprocess.TimeoutExpired:
-        print("[tick] agent timed out")
-        return False, "[timeout]"
-    except Exception as e:
-        print(f"[tick] agent error: {e}")
-        return False, str(e)
+    if timed_out:
+        return False, output  # partial output retained
+    if rc != 0:
+        print(f"[tick] agent exit rc={rc}")
+    return stop, output
 
 
 def _agent_available() -> bool:
@@ -1495,7 +1574,7 @@ def run_preflight():
         sys.exit(2)
 
     if pending_hash:
-        if agent_output and "PROGRAM_SYNC_DONE=1" in agent_output:
+        if agent_output and _program_sync_done(agent_output):
             mark_userprompt_synced(pending_hash)
             print(f"[preflight] userprompt synced (sha={pending_hash[:8]})")
         else:
@@ -1557,11 +1636,23 @@ def run_tick():
     scan_state = load_scan_state()
     new_logs = find_new_logs(scan_state)
 
+    # Cold-start / propose-mode handling.
+    # Reactive-only tick (the original behaviour) deadlocks on a fresh
+    # workspace: preflight is forbidden from proposing, ticks only fire
+    # on new logs, so without external nudge the loop never starts.
+    # Solution: when there are NO new logs AND NO training currently
+    # running, fall through to invoke the agent in propose-only mode.
+    # If training IS in flight we still wait — no parallel proposals.
+    propose_mode = False
     if not new_logs:
-        print("[tick] no new logs found")
-        return
+        if _training_in_progress():
+            print("[tick] no new logs; training still in flight — waiting")
+            return
+        print("[tick] no new logs; entering propose mode (no training in flight)")
+        propose_mode = True
 
-    print(f"[tick] found {len(new_logs)} new/updated log(s)")
+    if not propose_mode:
+        print(f"[tick] found {len(new_logs)} new/updated log(s)")
     anchors = load_plan_anchors()
     best_metric = load_best_metric()
 
@@ -1612,12 +1703,14 @@ def run_tick():
     update_scan_state(scan_state, new_logs)
     save_scan_state(scan_state)
 
-    if not new_results:
+    # In propose mode there's nothing to evaluate — skip results-processing
+    # guards and go straight to agent invocation so it can seed/propose.
+    if not propose_mode and not new_results:
         print("[tick] no completed runs to process")
         return
 
     all_results = [r for r, _ in new_results]
-    if check_global_stop(all_results):
+    if not propose_mode and check_global_stop(all_results):
         print("[tick] *** GLOBAL STOP THRESHOLD MET ***")
         # No agent ran this tick, so cycle counter is unchanged; capture
         # the final log.md / memory.md state for posterity, then push.
@@ -1691,7 +1784,7 @@ def run_tick():
     # Mark userprompt synced only if the agent confirmed it did the translation.
     # Otherwise the directive will repeat on the next tick.
     if pending_hash:
-        if agent_output and "PROGRAM_SYNC_DONE=1" in agent_output:
+        if agent_output and _program_sync_done(agent_output):
             mark_userprompt_synced(pending_hash)
             print(f"[tick] userprompt sync confirmed (sha={pending_hash[:8]})")
         else:
