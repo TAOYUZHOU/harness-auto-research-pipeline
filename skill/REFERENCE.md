@@ -129,15 +129,51 @@ engine's scan paths.
 
 ---
 
+---
+
+## `harp_web.sh` — FastAPI web UI
+
+Launches a single-page web app that wraps every other script in this
+skill. Auto-installs `fastapi` + `uvicorn` + `pyyaml` to `~/.local`
+on first run.
+
+**Env vars:**
+- `PORT` (default `8765`)
+- `HOST` (default `127.0.0.1`; **never** set to `0.0.0.0` on a public network — no auth)
+
+**Flags:**
+- `--install` — only install dependencies, don't start the server
+- `-h`, `--help`
+
+**Pages:** Dashboard, Config (edit `meta_info` + `userprompt` in
+browser with YAML validation), Logs (raw + Chinese polish side-by-side),
+Actions (run polish/doctor/tick with live SSE output + `tick.log` tail),
+Usage (token cost dashboard).
+
+**Endpoints:** see `/api/docs` (auto-generated Swagger UI) or
+`skill/web/README.md`.
+
+**Recommended remote-machine workflow:**
+```bash
+# on the remote box
+nohup bash skill/scripts/harp_web.sh > /tmp/harp_web.log 2>&1 &
+# on your laptop
+ssh -L 8765:127.0.0.1:8765 user@remote
+# then open http://localhost:8765 in your laptop browser
+```
+
+---
+
 ## Composition patterns
 
 ### Continuous monitoring on a remote SSH box
 
 ```bash
-# Three things keep running independently:
-bash skill/scripts/install_cron.sh install                   # already part of init
+# Four things keep running independently:
+bash skill/scripts/install_cron.sh install                       # part of init
 nohup bash skill/scripts/harp_polish_daemon.sh > /dev/null 2>&1 &
-watch -n 30 bash skill/scripts/harp_status.sh                # in a tmux pane
+nohup bash skill/scripts/harp_web.sh > /tmp/harp_web.log 2>&1 &  # web UI
+# Then on laptop: ssh -L 8765:127.0.0.1:8765 remote-box
 ```
 
 ### Quick manual check between SSH sessions

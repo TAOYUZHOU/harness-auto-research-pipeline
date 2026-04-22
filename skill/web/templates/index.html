@@ -1,0 +1,453 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>HARP web UI</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+[x-cloak] { display: none !important; }
+pre.term { background: #0d1117; color: #e6edf3; padding: 1rem;
+           font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+           font-size: 12px; overflow-x: auto; max-height: 60vh;
+           border-radius: 6px; white-space: pre-wrap; word-break: break-all; }
+pre.zh   { background: #fafafa; color: #1f2937; padding: 1rem;
+           font-family: ui-sans-serif, system-ui, sans-serif;
+           font-size: 13px; line-height: 1.6; max-height: 60vh;
+           overflow-y: auto; border-radius: 6px; white-space: pre-wrap; }
+.pill    { display: inline-block; padding: 2px 8px; border-radius: 999px;
+           font-size: 11px; font-weight: 600; }
+.pill-ok { background: #d1fae5; color: #065f46; }
+.pill-bad { background: #fee2e2; color: #991b1b; }
+.pill-warn { background: #fef3c7; color: #92400e; }
+.pill-info { background: #dbeafe; color: #1e40af; }
+.tab-active { border-bottom: 2px solid #2563eb; color: #2563eb; }
+textarea.code { font-family: ui-monospace, monospace; font-size: 12px;
+                line-height: 1.4; }
+</style>
+</head>
+<body class="bg-gray-50 text-gray-900" x-data="harp()" x-init="init()">
+
+<header class="bg-white border-b">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div>
+      <h1 class="text-xl font-bold">HARP <span class="text-gray-400 text-sm font-normal">— Auto-Research Pipeline</span></h1>
+      <p class="text-xs text-gray-500" x-text="status?.workspace || '...'"></p>
+    </div>
+    <div class="flex items-center gap-3 text-sm">
+      <span class="pill" :class="status?.iteration?.active ? 'pill-ok' : 'pill-warn'"
+            x-text="status?.iteration?.active ? 'iterating' : 'paused'"></span>
+      <span class="pill pill-info" x-text="`cycle ${status?.iteration?.cycle ?? '?'}/${status?.iteration?.max_cycle ?? '?'}`"></span>
+      <span class="pill" :class="status?.cron_installed ? 'pill-ok' : 'pill-warn'"
+            x-text="status?.cron_installed ? 'cron on' : 'cron off'"></span>
+      <span class="text-xs text-gray-400" x-text="lastUpdated"></span>
+    </div>
+  </div>
+  <nav class="max-w-7xl mx-auto px-4 flex gap-6 text-sm">
+    <template x-for="t in tabs" :key="t">
+      <button @click="tab = t"
+              :class="tab === t ? 'tab-active py-3 font-medium' : 'py-3 text-gray-500 hover:text-gray-900'"
+              x-text="t"></button>
+    </template>
+  </nav>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-6">
+
+<section x-show="tab === 'Dashboard'" x-cloak>
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+
+    <div class="bg-white rounded-lg shadow p-4 col-span-1">
+      <h2 class="font-semibold mb-2">Target</h2>
+      <dl class="text-sm space-y-1">
+        <div class="flex justify-between"><dt class="text-gray-500">name</dt><dd x-text="status?.target?.name"></dd></div>
+        <div class="flex justify-between"><dt class="text-gray-500">repo</dt><dd class="font-mono text-xs truncate ml-2" :title="status?.target?.repo" x-text="status?.target?.repo"></dd></div>
+        <div class="flex justify-between"><dt class="text-gray-500">metric</dt><dd x-text="status?.target?.metric"></dd></div>
+      </dl>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-4">
+      <h2 class="font-semibold mb-2">Best so far</h2>
+      <p class="text-3xl font-bold tabular-nums" x-text="status?.iteration?.best || '-'"></p>
+      <p class="text-sm text-gray-500 mt-1">
+        target &le; <span class="font-mono" x-text="status?.iteration?.stop_threshold"></span>
+      </p>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-4">
+      <h2 class="font-semibold mb-2">Last tick</h2>
+      <p class="text-2xl font-bold tabular-nums" x-text="lastTickHuman"></p>
+      <p class="text-sm text-gray-500 mt-1" x-show="status?.remote">
+        remote: <span class="text-xs font-mono" x-text="status?.remote?.url || ''"></span>
+        <span class="pill ml-1" :class="(status?.remote?.unpushed||0) > 0 ? 'pill-warn' : 'pill-ok'"
+              x-text="(status?.remote?.unpushed||0) > 0 ? `+${status.remote.unpushed} unpushed` : 'in sync'"></span>
+      </p>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-4 col-span-1 md:col-span-3">
+      <h2 class="font-semibold mb-2">In-flight training</h2>
+      <template x-if="(status?.training_processes||[]).length === 0">
+        <p class="text-sm text-gray-500">(no training process detected)</p>
+      </template>
+      <table class="w-full text-sm" x-show="(status?.training_processes||[]).length > 0">
+        <thead class="text-xs text-gray-500 uppercase border-b">
+          <tr><th class="text-left py-1">PID</th><th class="text-left">elapsed</th><th class="text-left">budget</th><th class="text-left">cmd</th></tr>
+        </thead>
+        <tbody>
+          <template x-for="t in (status?.training_processes||[])" :key="t.pid">
+            <tr class="border-b last:border-0">
+              <td class="py-2 font-mono" x-text="t.pid"></td>
+              <td x-text="humanDur(t.elapsed_sec)"></td>
+              <td>
+                <span x-show="t.remaining_sec === null" class="text-gray-400">inf</span>
+                <span x-show="t.remaining_sec !== null && !t.over_budget" x-text="`${humanDur(t.remaining_sec)} left`"></span>
+                <span x-show="t.over_budget" class="pill pill-bad">OVER BUDGET</span>
+              </td>
+              <td class="font-mono text-xs text-gray-500 truncate max-w-md" :title="t.cmd" x-text="t.cmd"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="bg-white rounded-lg shadow p-4 col-span-1 md:col-span-3">
+      <h2 class="font-semibold mb-2">In-flight metric (live log scan)</h2>
+      <template x-if="(status?.inflight_runs||[]).length === 0">
+        <p class="text-sm text-gray-500">(no in-flight snapshot yet)</p>
+      </template>
+      <table class="w-full text-sm" x-show="(status?.inflight_runs||[]).length > 0">
+        <thead class="text-xs text-gray-500 uppercase border-b">
+          <tr><th class="text-left py-1">anchor</th><th class="text-left">last epoch</th><th class="text-left">best</th><th class="text-left">best epoch</th><th class="text-left">plateau</th></tr>
+        </thead>
+        <tbody>
+          <template x-for="r in (status?.inflight_runs||[])" :key="r.anchor">
+            <tr class="border-b last:border-0">
+              <td class="py-2 font-mono text-xs" x-text="r.anchor"></td>
+              <td class="font-mono" x-text="r.last_epoch ?? '?'"></td>
+              <td class="font-mono font-semibold" x-text="r.best ?? '?'"></td>
+              <td class="font-mono" x-text="r.best_epoch ?? '?'"></td>
+              <td>
+                <span class="pill" :class="(r.plateau_epochs||0) >= 10 ? 'pill-bad' : ((r.plateau_epochs||0) >= 5 ? 'pill-warn' : 'pill-ok')"
+                      x-text="r.plateau_epochs ?? '?'"></span>
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+</section>
+
+<section x-show="tab === 'Config'" x-cloak class="space-y-6">
+  <template x-for="cfg in [{key:'meta', label:'meta_info/project.yaml (engine A - affects FUTURE workspaces)'},
+                          {key:'userprompt', label:'userprompt.yaml (workspace B - picked up by next tick)'}]"
+            :key="cfg.key">
+    <div class="bg-white rounded-lg shadow p-4">
+      <div class="flex items-center justify-between mb-2">
+        <h2 class="font-semibold" x-text="cfg.label"></h2>
+        <div class="flex items-center gap-2">
+          <button @click="loadConfig(cfg.key)"
+                  class="text-sm text-gray-600 hover:text-gray-900">reload</button>
+          <button @click="saveConfig(cfg.key)"
+                  class="text-sm bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700">save</button>
+          <span class="text-xs" :class="configStatus[cfg.key]?.error ? 'text-red-600' : 'text-green-700'"
+                x-text="configStatus[cfg.key]?.msg || ''"></span>
+        </div>
+      </div>
+      <textarea class="code w-full border rounded p-2"
+                rows="22"
+                x-model="configText[cfg.key]"
+                @keydown.tab.prevent="
+                  let s = $event.target.selectionStart;
+                  configText[cfg.key] = configText[cfg.key].substring(0, s) + '  ' + configText[cfg.key].substring($event.target.selectionEnd);
+                  $nextTick(() => $event.target.setSelectionRange(s+2, s+2));
+                "></textarea>
+    </div>
+  </template>
+</section>
+
+<section x-show="tab === 'Logs'" x-cloak>
+  <div class="flex items-center gap-3 mb-4">
+    <template x-for="k in ['log','memory','plan','program']" :key="k">
+      <button @click="logKind = k; loadFile(k)"
+              :class="logKind === k ? 'bg-blue-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'"
+              class="px-3 py-1 rounded text-sm border" x-text="k+'.md'"></button>
+    </template>
+    <div class="ml-auto flex items-center gap-3 text-sm">
+      <label class="flex items-center gap-1">
+        <input type="checkbox" x-model="showZh" @change="loadFile(logKind)" />
+        <span>show zh polish</span>
+      </label>
+      <button @click="loadFile(logKind)" class="text-gray-600 hover:text-gray-900">reload</button>
+    </div>
+  </div>
+  <div class="grid gap-4" :class="showZh ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'">
+    <div class="bg-white rounded-lg shadow p-4">
+      <h3 class="font-semibold mb-2 text-sm text-gray-600" x-text="`${logKind}.md (raw)`"></h3>
+      <pre class="term" x-text="fileText"></pre>
+    </div>
+    <div class="bg-white rounded-lg shadow p-4" x-show="showZh">
+      <h3 class="font-semibold mb-2 text-sm text-gray-600" x-text="`${logKind}.md (zh polish)`"></h3>
+      <div class="zh prose prose-sm max-w-none" x-html="zhHtml"></div>
+    </div>
+  </div>
+</section>
+
+<section x-show="tab === 'Actions'" x-cloak class="space-y-6">
+  <div class="bg-white rounded-lg shadow p-4">
+    <h2 class="font-semibold mb-3">Manual actions</h2>
+    <div class="flex flex-wrap gap-3">
+      <button @click="runAction('polish')" :disabled="actionRunning"
+              class="bg-purple-600 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-purple-700">
+        Polish (changed only)
+      </button>
+      <button @click="runAction('polish_force')" :disabled="actionRunning"
+              class="bg-purple-700 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-purple-800">
+        Polish (force re-do all)
+      </button>
+      <button @click="runAction('doctor')" :disabled="actionRunning"
+              class="bg-emerald-600 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-emerald-700">
+        Doctor (10-check health)
+      </button>
+      <button @click="runAction('tick')" :disabled="actionRunning"
+              class="bg-amber-600 text-white px-4 py-2 rounded disabled:opacity-50 hover:bg-amber-700">
+        Run one tick now (manual)
+      </button>
+      <span class="ml-auto text-sm" x-show="actionRunning">
+        <span class="pill pill-warn">running ...</span>
+      </span>
+    </div>
+    <pre class="term mt-4" x-text="actionOutput || '(output will appear here)'"
+         x-ref="actionTerm"></pre>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4">
+    <h2 class="font-semibold mb-3">Live tail - tick.log</h2>
+    <button @click="toggleTail('tick')"
+            :class="tailing.tick ? 'bg-red-600' : 'bg-blue-600'"
+            class="text-white px-3 py-1 rounded text-sm mb-3"
+            x-text="tailing.tick ? 'stop tail' : 'start tail'"></button>
+    <pre class="term" x-text="tailOutput.tick || '(not tailing)'" x-ref="tickTerm"></pre>
+  </div>
+</section>
+
+<section x-show="tab === 'Usage'" x-cloak>
+  <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+    <template x-for="(label, key) in {input_tokens:'input', output_tokens:'output', cache_read_tokens:'cache read', cache_write_tokens:'cache write'}" :key="key">
+      <div class="bg-white rounded-lg shadow p-4">
+        <p class="text-sm text-gray-500" x-text="label"></p>
+        <p class="text-2xl font-bold tabular-nums" x-text="(usage?.totals?.[key] || 0).toLocaleString()"></p>
+      </div>
+    </template>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4 mb-6">
+    <h2 class="font-semibold mb-2">By mode</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs text-gray-500 uppercase border-b">
+        <tr><th class="text-left py-1">mode</th><th class="text-right">calls</th><th class="text-right">in</th><th class="text-right">out</th><th class="text-right">cache r</th><th class="text-right">cache w</th></tr>
+      </thead>
+      <tbody>
+        <template x-for="(v, mode) in (usage?.by_mode || {})" :key="mode">
+          <tr class="border-b last:border-0">
+            <td class="py-2 font-mono" x-text="mode"></td>
+            <td class="text-right tabular-nums" x-text="v.calls || 0"></td>
+            <td class="text-right tabular-nums" x-text="(v.input_tokens||0).toLocaleString()"></td>
+            <td class="text-right tabular-nums" x-text="(v.output_tokens||0).toLocaleString()"></td>
+            <td class="text-right tabular-nums" x-text="(v.cache_read_tokens||0).toLocaleString()"></td>
+            <td class="text-right tabular-nums" x-text="(v.cache_write_tokens||0).toLocaleString()"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="bg-white rounded-lg shadow p-4">
+    <h2 class="font-semibold mb-2">Recent calls (last 50)</h2>
+    <table class="w-full text-xs font-mono">
+      <thead class="text-xs text-gray-500 uppercase border-b">
+        <tr><th class="text-left py-1">ts</th><th class="text-left">cycle</th><th class="text-left">mode</th><th class="text-right">in</th><th class="text-right">out</th><th class="text-right">cache r</th></tr>
+      </thead>
+      <tbody>
+        <template x-for="(r, i) in (usage?.records || []).slice().reverse()" :key="i">
+          <tr class="border-b last:border-0" :class="r.timed_out ? 'bg-red-50' : ''">
+            <td class="py-1" x-text="r.ts"></td>
+            <td x-text="r.cycle ?? ''"></td>
+            <td x-text="r.mode ?? ''"></td>
+            <td class="text-right" x-text="(r.input_tokens||0).toLocaleString()"></td>
+            <td class="text-right" x-text="(r.output_tokens||0).toLocaleString()"></td>
+            <td class="text-right" x-text="(r.cache_read_tokens||0).toLocaleString()"></td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</main>
+
+<footer class="text-center text-xs text-gray-400 py-4">
+  HARP web UI - <a href="/api/docs" class="underline hover:text-gray-600">API docs</a>
+</footer>
+
+<script>
+function harp() {
+  return {
+    tabs: ['Dashboard', 'Config', 'Logs', 'Actions', 'Usage'],
+    tab: 'Dashboard',
+    status: null,
+    usage: null,
+    lastUpdated: '',
+    configText: { meta: '', userprompt: '' },
+    configStatus: { meta: {}, userprompt: {} },
+    logKind: 'log',
+    showZh: true,
+    fileText: '',
+    zhText: '',
+    zhHtml: '',
+    actionOutput: '',
+    actionRunning: false,
+    tailing: { tick: false },
+    tailOutput: { tick: '' },
+    _eventSources: {},
+
+    async init() {
+      await this.refreshStatus();
+      setInterval(() => this.refreshStatus(), 10000);
+      this.$watch('tab', t => {
+        if (t === 'Config') { this.loadConfig('meta'); this.loadConfig('userprompt'); }
+        if (t === 'Logs')   { this.loadFile(this.logKind); }
+        if (t === 'Usage')  { this.refreshUsage(); }
+      });
+    },
+
+    async refreshStatus() {
+      try {
+        const r = await fetch('/api/status');
+        if (!r.ok) throw new Error(await r.text());
+        this.status = await r.json();
+        this.lastUpdated = '更新: ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        this.lastUpdated = '更新失败: ' + e.message;
+      }
+    },
+
+    async refreshUsage() {
+      const r = await fetch('/api/usage');
+      this.usage = await r.json();
+    },
+
+    async loadConfig(key) {
+      const r = await fetch('/api/config/' + key);
+      this.configText[key] = await r.text();
+      this.configStatus[key] = {};
+    },
+
+    async saveConfig(key) {
+      try {
+        const r = await fetch('/api/config/' + key, {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text: this.configText[key]}),
+        });
+        const data = await r.json();
+        if (!r.ok) {
+          this.configStatus[key] = {error: true, msg: data.detail || 'save failed'};
+        } else {
+          this.configStatus[key] = {error: false, msg: 'saved (' + data.bytes + 'b)'};
+          setTimeout(() => this.configStatus[key] = {}, 4000);
+        }
+      } catch (e) {
+        this.configStatus[key] = {error: true, msg: e.message};
+      }
+    },
+
+    async loadFile(kind) {
+      const r = await fetch('/api/files/' + kind);
+      this.fileText = await r.text();
+      if (this.showZh && kind !== 'program') {
+        const z = await fetch('/api/files/' + kind + '/zh');
+        this.zhText = await z.text();
+        this.zhHtml = marked.parse(this.zhText);
+      } else {
+        this.zhText = ''; this.zhHtml = '';
+      }
+    },
+
+    async runAction(name) {
+      this.actionOutput = '';
+      this.actionRunning = true;
+      const r = await fetch('/api/actions/' + name, {method: 'POST'});
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const {value, done} = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, {stream: true});
+        let lines = buf.split('\n\n');
+        buf = lines.pop();
+        for (const blk of lines) {
+          for (const ln of blk.split('\n')) {
+            if (ln.startsWith('data: ')) {
+              try {
+                const j = JSON.parse(ln.slice(6));
+                if (j.line !== undefined) this.actionOutput += j.line + '\n';
+                if (j.rc !== undefined)   this.actionOutput += `\n--- exit ${j.rc} ---\n`;
+                if (j.error)              this.actionOutput += `\nERROR: ${j.error}\n`;
+              } catch (e) {}
+            }
+          }
+          this.$nextTick(() => {
+            const t = this.$refs.actionTerm;
+            if (t) t.scrollTop = t.scrollHeight;
+          });
+        }
+      }
+      this.actionRunning = false;
+      this.refreshStatus();
+      if (name.startsWith('polish')) this.refreshUsage();
+    },
+
+    toggleTail(name) {
+      if (this.tailing[name]) {
+        this._eventSources[name]?.close();
+        this.tailing[name] = false;
+        return;
+      }
+      this.tailOutput[name] = '';
+      this.tailing[name] = true;
+      const es = new EventSource('/api/tail/' + name);
+      this._eventSources[name] = es;
+      es.onmessage = (e) => {
+        try {
+          const j = JSON.parse(e.data);
+          if (j.line !== undefined) this.tailOutput[name] += j.line + '\n';
+          this.$nextTick(() => {
+            const t = this.$refs[name + 'Term'];
+            if (t) t.scrollTop = t.scrollHeight;
+          });
+        } catch (e) {}
+      };
+      es.onerror = () => { this.tailing[name] = false; es.close(); };
+    },
+
+    humanDur(s) {
+      if (s == null) return '?';
+      if (s < 60) return s + 's';
+      if (s < 3600) return `${Math.floor(s/60)}m${s%60}s`;
+      if (s < 86400) return `${Math.floor(s/3600)}h${Math.floor((s%3600)/60)}m`;
+      return `${Math.floor(s/86400)}d${Math.floor((s%86400)/3600)}h`;
+    },
+
+    get lastTickHuman() {
+      const a = this.status?.last_tick_age_sec;
+      return a == null ? '-' : this.humanDur(a) + ' ago';
+    },
+  };
+}
+</script>
+</body>
+</html>

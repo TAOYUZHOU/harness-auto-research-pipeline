@@ -16,7 +16,9 @@ Inspired by [autoresearch](https://github.com/karpathy/autoresearch).
 > and [`skill/EXAMPLES.md`](skill/EXAMPLES.md). Skill bundle ships
 > `harp_init` (4-question wizard), `harp_status` (dashboard),
 > `harp_polish` (Chinese log/memory/plan polishing in fresh chats),
-> `harp_doctor` (10-check health), and a polish daemon.
+> `harp_doctor` (10-check health), a polish daemon, and `harp_web`
+> (FastAPI single-page UI: dashboard, config editor, log viewer with
+> Chinese polish, action buttons with live SSE output).
 
 ## Quick start
 

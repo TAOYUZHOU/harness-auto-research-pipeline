@@ -98,6 +98,15 @@ on-demand (`harp_polish.sh --once`).
 Quickly verifies cron / agent CLI / git remote / disk space / engine
 consistency. Run when something feels stuck.
 
+### 6. Web UI (`harp_web.sh`) — optional GUI
+
+A single-page FastAPI app on top of all the above scripts. Browse the
+dashboard, edit `meta_info/project.yaml` + `userprompt.yaml` in a
+textarea (with YAML validation), view raw + Chinese-polished
+`log/memory/plan` side-by-side, click buttons to run polish/doctor/tick
+with live SSE output, watch token cost over time, and tail `tick.log`
+in real time. See [`web/README.md`](web/README.md).
+
 ---
 
 ## Usage examples
@@ -117,6 +126,9 @@ nohup bash skill/scripts/harp_polish_daemon.sh > /tmp/harp_polish.log 2>&1 &
 
 # Health check
 bash skill/scripts/harp_doctor.sh
+
+# Web UI (optional)
+bash skill/scripts/harp_web.sh   # then open http://127.0.0.1:8765
 ```
 
 ---
