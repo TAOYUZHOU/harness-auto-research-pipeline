@@ -1,0 +1,113 @@
+# meta_info/project.yaml — STARTER TEMPLATE
+#
+# Copy this file to <ENGINE>/meta_info/project.yaml and fill in every
+# `__TODO__` placeholder.  harp_init.sh does this interactively; run
+# it instead of editing manually unless you know what you're doing.
+#
+# After editing:
+#   bash scripts/init_workspace.sh   # renders B/
+#   bash scripts/quickstart.sh       # preflight + verify
+#   bash scripts/install_cron.sh install
+# -----------------------------------------------------------------------------
+
+harness:
+  version: 2
+
+  # --- where the workspace (Repo B) lives ---------------------------------
+  workspace:
+    dir: __TODO_ABSOLUTE_PATH_TO_NEW_WORKSPACE__   # e.g. /root/work/harp-myproject
+
+  # --- target repos to optimise (one or many) -----------------------------
+  targets:
+    - name: __TODO_PROJECT_NAME__                  # short id, e.g. "myproject"
+      repo_path: __TODO_ABSOLUTE_PATH_TO_REPO_D__
+      result_root: results                          # subfolder of repo_path containing run dirs
+      log_glob: nohup_train.log                     # filename HARP looks for in each run dir
+      agent_addition_dir: add_by_HARP               # agent-only writeable subdir in D
+      editable_files:                               # files with AGENT-EDITABLE blocks
+        - __TODO_RELATIVE_PATH_TO_TRAIN_SCRIPT__   # e.g. tlc/scripts/train.py
+      primary_metric: __TODO_METRIC_NAME__         # e.g. best_val_mae
+      primary_metric_op: __TODO_lt_or_gt__         # lt = lower-is-better, gt = higher-is-better
+      stop_threshold: __TODO_STOP_VALUE__          # iteration stops when best beats this
+
+  # --- agent CLI (cursor-agent) settings ----------------------------------
+  agent:
+    bin: cursor-agent
+    timeout_sec: 600
+    model: ""                # empty = use cursor-agent's default
+
+  # --- cron schedule -------------------------------------------------------
+  schedule:
+    cron_minute: "*/15"      # every 15 minutes
+    max_cycle: 10            # 0 = unlimited
+    train_time_budget_sec: 28800   # 8 h, 0 = unlimited
+
+  # --- workspace remote (Repo B push to GitHub) ---------------------------
+  workspace_remote:
+    mode: manual             # auto | manual | none
+    org: ""                  # only used when mode=auto (your gh user/org)
+    visibility: private      # only used when mode=auto
+    push_on: keep            # keep | every_tick | never
+
+# =============================================================================
+# userprompt — written verbatim into B/userprompt.yaml.  These are the
+# natural-language constraints the agent translates into HARD CONSTRAINTs.
+# Add as many `rules:` items as you need; each one is a free-form sentence.
+# =============================================================================
+
+userprompt:
+  version: 1
+  rules:
+    # Required: state the baseline so the agent has an anchor.
+    - >
+      Baseline is __TODO_BASELINE_NAME__ with __TODO_METRIC_NAME__ =
+      __TODO_BASELINE_VALUE__.  Every new experiment must explain in
+      plan.md::motivation what diff vs baseline it tests.
+
+    # Recommended (engine-validated patterns — keep these):
+    - >
+      两阶段实验流程: 先 screening 后 full run。每个新 axis 默认先用 epochs<=80 +
+      early_stop_epoch<=20 的"筛选轮"; 只有当连续 2 个 screening 把
+      best 提升 >=5% 时才允许提交一次完整 epochs run。screening run 的
+      anchor 必须以 _scr 结尾。
+
+    - >
+      abandon-on-plateau: 任何 in-flight 训练若连续 >=10 epoch 内主指标
+      改善 < 0.005 (绝对值), 视为 plateau, agent 应在下一 tick 评估是否
+      手动 git_discard 并启动下一 plan。
+
+    - >
+      显存 / 吞吐优先: 新 plan 的训练命令应尽可能用大 batch_size 把单卡显存
+      吃满 (从 256/512 起步, OOM 再下调一档), 减少梯度噪声和 wall-clock。
+      同时确保 lr 随 batch_size 线性放大或开 LR warmup 以避免震荡。
+
+  notes: |
+    Free-form user notes about the project context.  Surfaced in the
+    agent prompt verbatim.  Update as you learn.
+
+# =============================================================================
+# cursorrules — written verbatim into B/.cursorrules.  Substitutions:
+#   ${WORK_DIR}     → harness.workspace.dir
+#   ${SERVICE_ROOT} → engine repo absolute path
+#   ${TARGET_ROOT}  → harness.targets[0].repo_path
+# =============================================================================
+
+cursorrules:
+  dynamic_scan: true     # if true, init_workspace.sh appends a fresh
+                         # snapshot of available scripts/configs/results
+  header: |
+    Project: __TODO_PROJECT_NAME__ optimisation harness.
+
+    Working directory: ${WORK_DIR}
+    Target codebase:   ${TARGET_ROOT}
+    Engine (read-only): ${SERVICE_ROOT}
+
+    The full constitution lives in program.md.  Key rules:
+      - Edit only AGENT-EDITABLE blocks in editable_files, OR new
+        files under <target>/${TARGET_ROOT##*/}/add_by_HARP/.
+      - Commit experiments in the target repo with anchor as branch
+        name; HARP tags successful ones as exp/<anchor>/<ts>.
+      - Read userprompt.yaml for human-language constraints.
+      - Use GitNexus MCP tools to understand the target before editing.
+
+    See plan.md for current experiments and memory.md for prior lessons.

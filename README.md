@@ -9,6 +9,15 @@ marked `AGENT-EDITABLE` blocks.
 
 Inspired by [autoresearch](https://github.com/karpathy/autoresearch).
 
+> **New: HARP is also a [Cursor / Claude Code skill](skill/SKILL.md).**
+> If you have an agent-aware editor installed, you can skip the manual
+> setup below — just `ln -s skill ~/.cursor/skills/harp` and ask the
+> agent "set up HARP for repo X". See [`skill/INSTALL.md`](skill/INSTALL.md)
+> and [`skill/EXAMPLES.md`](skill/EXAMPLES.md). Skill bundle ships
+> `harp_init` (4-question wizard), `harp_status` (dashboard),
+> `harp_polish` (Chinese log/memory/plan polishing in fresh chats),
+> `harp_doctor` (10-check health), and a polish daemon.
+
 ## Quick start
 
 ### 0. one-time prerequisites
