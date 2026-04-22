@@ -81,8 +81,8 @@ harness:
 
   # -- Workspace remote (optional GitHub backup of repo B) --
   workspace_remote:
-    mode: none                   # auto | manual | none
-    org: ""                      # gh org/user, only used when mode=auto
+    mode: auto                   # auto | manual | none
+    org: TAOYUZHOU               # gh org/user, only used when mode=auto
     visibility: private          # private | public, only used when mode=auto
     push_on: keep                # keep | every_tick | never
 

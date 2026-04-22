@@ -22,8 +22,9 @@
 # pointing one A at several Bs.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export SERVICE_ROOT="${SCRIPT_DIR}"
+_HARP_ENV_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SERVICE_ROOT="${_HARP_ENV_DIR}"
+unset _HARP_ENV_DIR
 
 # ── Stage 1: bootstrap WORK_DIR from meta_info ─────────────────────────────
 META_FILE="${SERVICE_ROOT}/meta_info/project.yaml"
