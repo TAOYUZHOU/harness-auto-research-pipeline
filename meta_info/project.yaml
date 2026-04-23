@@ -67,6 +67,9 @@ harness:
     timeout_sec: 600             # 10 min — propose ticks need extra room when PROGRAM SYNC also pending
     max_log_lines: 50
     memory_tail_blocks: 5        # number of recent ## EXP_ID: blocks to inject
+    memory_max_chars: 8000       # hard char budget for memory.md tail in prompt; 0 = unbounded
+    log_max_chars: 6000          # hard char budget for log.md tail in prompt; 0 = unbounded
+    log_hide_in_progress: true   # drop STATUS=in_progress from log.md (already shown in IN-FLIGHT block)
     flags:
       - "--approve-mcps"
       - "--trust"

@@ -168,6 +168,20 @@ PREFLIGHT_OK_FILE = STATE_DIR / "preflight_ok"
 
 AGENT_MAX_MEMORY_BLOCKS = int(os.environ.get(
     "AGENT_MAX_MEMORY_BLOCKS", _agent.get("memory_tail_blocks", 5)))
+# Char-budget for the memory.md tail in the prompt (per tick). 0 = unbounded.
+# Memory blocks can grow to ~3-4 KB each, so 5 raw blocks is easily 15-20 KB
+# of mostly stale context. Default 8 KB keeps the recent 1-2 + latest keep.
+AGENT_MEMORY_MAX_CHARS = int(os.environ.get(
+    "AGENT_MEMORY_MAX_CHARS", _agent.get("memory_max_chars", 8000)))
+# Char-budget for the log.md tail in the prompt. 0 = unbounded.
+AGENT_LOG_MAX_CHARS = int(os.environ.get(
+    "AGENT_LOG_MAX_CHARS", _agent.get("log_max_chars", 6000)))
+# Drop noisy STATUS=in_progress lines from the log.md prompt segment;
+# they are already represented by the dedicated IN-FLIGHT block.
+AGENT_LOG_HIDE_IN_PROGRESS = (
+    str(os.environ.get("AGENT_LOG_HIDE_IN_PROGRESS", "")).lower() == "true"
+    or _agent.get("log_hide_in_progress", True)
+)
 
 # Template paths (read-only)
 PROGRAM_FILE = SERVICE_ROOT / "program.md"
@@ -1118,20 +1132,70 @@ def dequeue_pending_memory(exp_ids):
     return removed
 
 
-def tail_memory(k: int) -> str:
-    """Return the last `k` `## EXP_ID:` blocks from memory.md, joined
-    verbatim.  k <= 0 returns the whole file (minus the header)."""
+_MEMORY_VERDICT_KEEP_RE = re.compile(
+    r"^\s*-\s*VERDICT:\s*keep\b", re.MULTILINE | re.IGNORECASE
+)
+
+
+def tail_memory(k: int, *, max_chars: int = 0) -> str:
+    """Select up to `k` `## EXP_ID:` blocks from memory.md, biased
+    towards (a) the most-recent K-1 blocks (recent context) and
+    (b) the single most-recent VERDICT=keep block (current anchor
+    reference) if it would otherwise be dropped. Blocks are returned
+    in chronological order and joined verbatim.
+
+    If `max_chars > 0` and the joined output exceeds it, drop oldest
+    blocks one at a time until under the cap, prepending a notice.
+
+    `k <= 0` returns every block."""
     if not MEMORY_FILE.exists():
         return ""
     text = MEMORY_FILE.read_text()
     matches = list(MEMORY_HEADING_RE.finditer(text))
     if not matches:
         return ""
-    if k > 0 and len(matches) > k:
-        start = matches[-k].start()
+
+    blocks: list[dict] = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end]
+        blocks.append({
+            "idx": i,
+            "exp_id": m.group(1),
+            "body": body,
+            "is_keep": bool(_MEMORY_VERDICT_KEEP_RE.search(body)),
+        })
+
+    if k <= 0 or len(blocks) <= k:
+        chosen = list(blocks)
     else:
-        start = matches[0].start()
-    return text[start:].rstrip() + "\n"
+        recent = blocks[-(k - 1):] if k > 1 else []
+        recent_idx = {b["idx"] for b in recent}
+        # Inject the most-recent keep if not already in the recent slice;
+        # otherwise just pad with the next-oldest non-recent block to fill k.
+        latest_keep = next((b for b in reversed(blocks) if b["is_keep"]), None)
+        if latest_keep is not None and latest_keep["idx"] not in recent_idx:
+            recent = [latest_keep] + recent
+        else:
+            for b in reversed(blocks):
+                if b["idx"] not in recent_idx:
+                    recent.append(b)
+                    break
+        chosen = sorted(recent, key=lambda b: b["idx"])
+
+    notice = ""
+    if max_chars > 0:
+        total = sum(len(b["body"]) for b in chosen)
+        while len(chosen) > 1 and total > max_chars:
+            dropped = chosen.pop(0)
+            total -= len(dropped["body"])
+        if len(chosen) < len(blocks):
+            notice = ("(older / less-relevant entries omitted; see memory.md"
+                      " for full history)\n\n")
+
+    out = "".join(b["body"] for b in chosen).rstrip() + "\n"
+    return notice + out if notice else out
 
 
 def parse_memory_done(agent_output: str) -> list[str]:
@@ -1182,15 +1246,33 @@ Steps (mandatory, in order):
     # stash current hash so caller can mark synced after a successful invoke
     build_agent_prompt._pending_userprompt_hash = cur_hash if dirty else ""
 
+    # log.md tail — drop blanks, comments, and (optionally) STATUS=in_progress
+    # snapshots since the latter are already represented verbatim in the
+    # dedicated IN-FLIGHT block of the prompt and would otherwise repeat
+    # tens of nearly-identical lines per epoch.
     log_lines = []
+    log_hidden_in_progress = 0
     if LOG_FILE.exists():
-        all_lines = [l for l in LOG_FILE.read_text().splitlines()
+        raw_lines = [l for l in LOG_FILE.read_text().splitlines()
                      if l.strip() and not l.startswith("#")]
-        log_lines = all_lines[-AGENT_MAX_LOG_LINES:]
+        if AGENT_LOG_HIDE_IN_PROGRESS:
+            kept = [l for l in raw_lines if "STATUS=in_progress" not in l]
+            log_hidden_in_progress = len(raw_lines) - len(kept)
+            raw_lines = kept
+        log_lines = raw_lines[-AGENT_MAX_LOG_LINES:]
+        # Char-budget on the log tail too — drop oldest lines first.
+        if AGENT_LOG_MAX_CHARS > 0:
+            total = sum(len(l) + 1 for l in log_lines)
+            while len(log_lines) > 1 and total > AGENT_LOG_MAX_CHARS:
+                total -= len(log_lines[0]) + 1
+                log_lines = log_lines[1:]
 
     # memory.md tail — recent research history for the agent to reference
     # when writing motivations / hypotheses for the next experiment.
-    memory_tail_text = tail_memory(AGENT_MAX_MEMORY_BLOCKS)
+    # Smart selection: most-recent K-1 + the latest VERDICT=keep block
+    # (current anchor reference), capped by AGENT_MEMORY_MAX_CHARS.
+    memory_tail_text = tail_memory(AGENT_MAX_MEMORY_BLOCKS,
+                                   max_chars=AGENT_MEMORY_MAX_CHARS)
 
     # Pending memory entries — closed experiments that still need a
     # narrative block.  Re-prompted every tick until the agent confirms
@@ -1311,10 +1393,10 @@ IMPORTANT: You are operating in workspace directory: {WORK_DIR}
 === plan.md (current plans) ===
 {plan_text}
 
-=== memory.md (last {AGENT_MAX_MEMORY_BLOCKS} experiment block(s)) ===
+=== memory.md (selected up to {AGENT_MAX_MEMORY_BLOCKS} block(s): recent + latest VERDICT=keep, char-budget {AGENT_MEMORY_MAX_CHARS or 'unbounded'}) ===
 {memory_tail_text or '(memory.md is empty — this is the first experiment journal entry to come)'}
 
-=== log.md (recent {len(log_lines)} lines) ===
+=== log.md (recent {len(log_lines)} line(s){f"; {log_hidden_in_progress} STATUS=in_progress lines hidden — see IN-FLIGHT block" if log_hidden_in_progress else ""}) ===
 {chr(10).join(log_lines)}
 
 === NEW RESULTS THIS TICK ===
